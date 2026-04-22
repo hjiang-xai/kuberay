@@ -143,7 +143,7 @@ func (r *RayJobReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 			logger.Error(err, "Failed to remove finalizer for RayJob")
 			return ctrl.Result{RequeueAfter: RayJobDefaultRequeueDuration}, err
 		}
-		return ctrl.Result{RequeueAfter: RayJobDefaultRequeueDuration}, err
+		return ctrl.Result{}, nil
 	}
 
 	// Please do NOT modify `originalRayJobInstance` in the following code.
