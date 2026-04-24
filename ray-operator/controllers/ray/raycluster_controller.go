@@ -30,6 +30,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -45,6 +46,7 @@ import (
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/pgd"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
 	"github.com/ray-project/kuberay/ray-operator/pkg/features"
+	pgdv1alpha1 "github.com/ray-project/kuberay/ray-operator/third_party/pgd/v1alpha1"
 )
 
 type reconcileFunc func(context.Context, *rayv1.RayCluster) error
@@ -1571,7 +1573,14 @@ func (r *RayClusterReconciler) SetupWithManager(mgr ctrl.Manager, reconcileConcu
 		))).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.Service{}).
-		Owns(&corev1.Secret{})
+		Owns(&corev1.Secret{}).
+		// PGD mode: pods are owned by the PGD, not the RayCluster, so the
+		// Owns(Pod) above does not enqueue for those events. Add an explicit
+		// PGD ownership watch (drives reconcile on PGD spec/status changes)
+		// plus a label-based Pod watch so we still see pod-level events for
+		// PGD-owned pods.
+		Owns(&pgdv1alpha1.PodGroupDeployment{}).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(pgd.MapPodToRayCluster))
 	if r.options.BatchSchedulerManager != nil {
 		r.options.BatchSchedulerManager.ConfigureReconciler(b)
 	}
