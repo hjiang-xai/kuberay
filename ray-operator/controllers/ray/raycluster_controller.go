@@ -1688,6 +1688,20 @@ func (r *RayClusterReconciler) calculateStatus(ctx context.Context, instance *ra
 		}
 	}
 
+	// PGD mode: while pods are not yet materialized (Status.State stays
+	// empty, same as any other RayCluster whose pods cannot schedule),
+	// surface the PGD queue state in Status.Reason so users see WHY without
+	// having to `kubectl get pgd` themselves. Once all PGDs are fully
+	// allocated, QueueStatusReason returns "" and we leave the existing
+	// Reason untouched (the Ready branch above clears it).
+	if pgd.IsEnabled(newInstance) && newInstance.Status.State != rayv1.Ready {
+		if reason, err := r.pgdHelper.QueueStatusReason(ctx, newInstance); err != nil {
+			logger.Info("PGD queue status read failed", "error", err)
+		} else if reason != "" {
+			newInstance.Status.Reason = reason
+		}
+	}
+
 	// Check if the head node is running and ready by checking the head pod's status or if the cluster has been suspended.
 	if statusConditionGateEnabled {
 		headPod, err := common.GetRayClusterHeadPod(ctx, r, newInstance)
