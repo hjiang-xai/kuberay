@@ -42,6 +42,7 @@ import (
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/common"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/expectations"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/metrics"
+	"github.com/ray-project/kuberay/ray-operator/controllers/ray/pgd"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
 	"github.com/ray-project/kuberay/ray-operator/pkg/features"
 )
@@ -57,6 +58,7 @@ func NewReconciler(mgr manager.Manager, options RayClusterReconcilerOptions) *Ra
 		Scheme:                     mgr.GetScheme(),
 		Recorder:                   mgr.GetEventRecorderFor("raycluster-controller"),
 		rayClusterScaleExpectation: expectations.NewRayClusterScaleExpectation(mgr.GetClient()),
+		pgdHelper:                  pgd.New(mgr.GetClient(), mgr.GetScheme()),
 		options:                    options,
 	}
 }
@@ -67,6 +69,7 @@ type RayClusterReconciler struct {
 	Scheme                     *k8sruntime.Scheme
 	Recorder                   record.EventRecorder
 	rayClusterScaleExpectation expectations.RayClusterScaleExpectation
+	pgdHelper                  *pgd.Helper
 	options                    RayClusterReconcilerOptions
 }
 
@@ -101,6 +104,8 @@ type RayClusterReconcilerOptions struct {
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=roles,verbs=get;list;watch;create;delete;update
 // +kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=rolebindings,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=apps.x.ai,resources=podgroupdeployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps.x.ai,resources=podgroupdeployments/status,verbs=get
 
 // [WARNING]: There MUST be a newline after kubebuilder markers.
 
@@ -1326,6 +1331,17 @@ func (r *RayClusterReconciler) createHeadPod(ctx context.Context, instance rayv1
 		}
 	}
 
+	// PGD-mode dispatcher: emit a PodGroupDeployment instead of creating the
+	// pod directly; PGD will materialize the head pod with nodeName preset.
+	if pgd.IsEnabled(&instance) {
+		if err := r.pgdHelper.UpsertPGDForHead(ctx, &instance, &pod); err != nil {
+			r.Recorder.Eventf(&instance, corev1.EventTypeWarning, string(utils.FailedToCreateHeadPod), "Failed to upsert head PGD for %s/%s, %v", instance.Namespace, instance.Name, err)
+			return err
+		}
+		logger.Info("PGD upserted for head", "rayCluster", instance.Name)
+		return nil
+	}
+
 	if err := r.Create(ctx, &pod); err != nil {
 		r.Recorder.Eventf(&instance, corev1.EventTypeWarning, string(utils.FailedToCreateHeadPod), "Failed to create head Pod %s/%s, %v", pod.Namespace, pod.Name, err)
 		return err
@@ -1347,6 +1363,19 @@ func (r *RayClusterReconciler) createWorkerPod(ctx context.Context, instance ray
 		} else {
 			return err
 		}
+	}
+
+	// PGD-mode dispatcher: in PGD mode worker pods are materialized by PGD
+	// from the upserted PodGroupDeployment, not created here. Per-pod creates
+	// from KubeRay are coalesced into a single PGD spec; this dispatcher is
+	// idempotent across multiple invocations within one reconcile.
+	if pgd.IsEnabled(&instance) {
+		if err := r.pgdHelper.UpsertPGDForGroup(ctx, &instance, &worker, &pod); err != nil {
+			r.Recorder.Eventf(&instance, corev1.EventTypeWarning, string(utils.FailedToCreateWorkerPod), "Failed to upsert worker PGD for group %s in cluster %s/%s, %v", worker.GroupName, instance.Namespace, instance.Name, err)
+			return err
+		}
+		logger.Info("PGD upserted for worker group", "rayCluster", instance.Name, "group", worker.GroupName)
+		return nil
 	}
 
 	replica := pod
@@ -1371,6 +1400,18 @@ func (r *RayClusterReconciler) createWorkerPodWithIndex(ctx context.Context, ins
 		} else {
 			return err
 		}
+	}
+
+	// PGD-mode dispatcher (multi-host indexing path). PGD's GroupSize handles
+	// per-replica multi-host gangs natively; per-host indexing is materialized
+	// by PGD via its rank label.
+	if pgd.IsEnabled(&instance) {
+		if err := r.pgdHelper.UpsertPGDForGroup(ctx, &instance, &worker, &pod); err != nil {
+			r.Recorder.Eventf(&instance, corev1.EventTypeWarning, string(utils.FailedToCreateWorkerPod), "Failed to upsert worker PGD for group %s in cluster %s/%s, %v", worker.GroupName, instance.Namespace, instance.Name, err)
+			return err
+		}
+		logger.Info("PGD upserted for worker group (indexed)", "rayCluster", instance.Name, "group", worker.GroupName, "replicaIndex", replicaIndex)
+		return nil
 	}
 
 	replica := pod
