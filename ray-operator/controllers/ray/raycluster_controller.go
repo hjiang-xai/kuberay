@@ -704,6 +704,15 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 
 		shouldDelete, reason := shouldDeletePod(headPod, rayv1.HeadNode)
 		logger.Info("reconcilePods", "head Pod", headPod.Name, "shouldDelete", shouldDelete, "reason", reason)
+		// PGD mode: PGD's classifier handles terminal pods (removes its
+		// finalizer, frees the node) and our PGD wrapper sets MinGroups=1 +
+		// shouldSkipHeadPodRestart (auto-set by SidecarMode) keeps KubeRay
+		// from recreating it. Skipping the direct r.Delete avoids a
+		// missingCount race where PGD would re-create the head from spec.
+		if shouldDelete && pgd.IsEnabled(instance) {
+			logger.Info("reconcilePods", "head Pod", headPod.Name, "PGD mode: deferring deletion to PGD classifier")
+			shouldDelete = false
+		}
 		if shouldDelete {
 			if err := r.Delete(ctx, &headPod); err != nil {
 				r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToDeleteHeadPod),
@@ -778,6 +787,32 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 			}
 			r.Recorder.Eventf(instance, corev1.EventTypeNormal, string(utils.DeletedWorkerPod),
 				"Deleted all pods for suspended worker group %s in RayCluster %s/%s", worker.GroupName, instance.Namespace, instance.Name)
+			continue
+		}
+
+		// PGD mode: in this branch, PGD owns the pods. Route scale-down
+		// through PGD's delete-next label, ensure pgd.Spec.Groups matches
+		// workerSpec.Replicas, and skip the per-pod delete/diff logic below
+		// (PGD's handleExcessGroups + missingCount handle scale up/down).
+		//
+		// Skipping the unhealthy-delete loop is intentional: PGD's classifier
+		// owns terminal-pod cleanup. With restartPolicy: Always (recommended
+		// for PGD-mode workers) container crashes are kubelet-restarted in
+		// place and shouldDeletePod rarely fires anyway.
+		if pgd.IsEnabled(instance) {
+			if len(worker.ScaleStrategy.WorkersToDelete) > 0 {
+				if err := r.pgdHelper.MarkAndScaleDown(ctx, instance, &worker); err != nil {
+					r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToDeleteWorkerPod), "Failed PGD scale-down for group %s: %v", worker.GroupName, err)
+					return errstd.Join(utils.ErrFailedDeleteWorkerPod, err)
+				}
+				worker.ScaleStrategy.WorkersToDelete = []string{}
+			}
+			// Build a representative pod template and upsert the PGD once for this group.
+			samplePod := r.buildWorkerPod(ctx, *instance, *worker.DeepCopy(), "", 0, 0)
+			if err := r.pgdHelper.UpsertPGDForGroup(ctx, instance, &worker, &samplePod); err != nil {
+				r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToCreateWorkerPod), "Failed upserting worker PGD for group %s: %v", worker.GroupName, err)
+				return errstd.Join(utils.ErrFailedCreateWorkerPod, err)
+			}
 			continue
 		}
 
