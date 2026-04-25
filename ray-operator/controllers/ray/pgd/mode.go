@@ -7,7 +7,7 @@ import (
 // IsEnabled returns true if the RayCluster should be reconciled in PGD-mode
 // (i.e., emit PodGroupDeployment CRs instead of creating Pods directly).
 //
-// Gated by the `ray.io/pgd-mode: "true"` annotation. Default is false, so
+// Gated by the `dataplatform.x.ai/ray-pgd-mode: "true"` annotation. Default is false, so
 // existing RayClusters and any cluster without the annotation continue to
 // use the upstream code path unchanged.
 func IsEnabled(instance *rayv1.RayCluster) bool {

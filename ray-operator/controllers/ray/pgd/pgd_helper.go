@@ -217,7 +217,7 @@ func applyCommonMeta(pgd *pgdv1alpha1.PodGroupDeployment, instance *rayv1.RayClu
 }
 
 // applyGroupBy stamps a GroupBy.Key on the PGD when the user has set the
-// ray.io/pgd-group-by-key annotation. PGDs sharing the same key are scheduled
+// dataplatform.x.ai/ray-pgd-group-by-key annotation. PGDs sharing the same key are scheduled
 // as one atomic unit (head + workers schedule together or not at all).
 func applyGroupBy(pgd *pgdv1alpha1.PodGroupDeployment, instance *rayv1.RayCluster) {
 	key := GroupByKeyFor(instance)
