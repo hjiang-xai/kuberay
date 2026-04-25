@@ -57,7 +57,7 @@ import (
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/common"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/expectations"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/metrics/mocks"
-	"github.com/ray-project/kuberay/ray-operator/controllers/ray/pgd"
+	"github.com/ray-project/kuberay/ray-operator/controllers/ray/batchscheduler"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
 	"github.com/ray-project/kuberay/ray-operator/pkg/client/clientset/versioned/scheme"
 	"github.com/ray-project/kuberay/ray-operator/pkg/features"
@@ -3896,48 +3896,96 @@ func TestShouldSkipHeadPodRestart(t *testing.T) {
 	tests := []struct {
 		name        string
 		annotations map[string]string
+		gangSched   bool // configure a PodLifecycleScheduler on the reconciler
 		want        bool
 	}{
 		{
-			name:        "no annotations -> false",
+			name:        "no annotations, no scheduler -> false",
 			annotations: nil,
+			gangSched:   false,
 			want:        false,
 		},
 		{
 			name:        "disable-provisioned-head-restart=true -> true",
 			annotations: map[string]string{utils.DisableProvisionedHeadRestartAnnotationKey: "true"},
+			gangSched:   false,
 			want:        true,
 		},
 		{
-			name:        "disable-provisioned-head-restart=false -> false",
+			name:        "disable-provisioned-head-restart=false, no scheduler -> false",
 			annotations: map[string]string{utils.DisableProvisionedHeadRestartAnnotationKey: "false"},
+			gangSched:   false,
 			want:        false,
 		},
 		{
-			// PGD owns the head lifecycle; KubeRay must not race PGD by re-asserting
-			// Spec.Groups=1 via createHeadPod when the head is briefly absent.
-			name:        "PGD mode annotation -> true",
-			annotations: map[string]string{pgd.PGDModeAnnotation: "true"},
+			// A PodLifecycleScheduler (PGD) owns the head lifecycle; KubeRay
+			// must not race the scheduler by re-asserting head presence via
+			// createHeadPod when the head is briefly absent.
+			name:        "PodLifecycleScheduler configured -> true",
+			annotations: nil,
+			gangSched:   true,
 			want:        true,
 		},
 		{
-			name:        "PGD mode annotation explicitly false -> false",
-			annotations: map[string]string{pgd.PGDModeAnnotation: "false"},
-			want:        false,
-		},
-		{
-			name: "both annotations set -> true",
-			annotations: map[string]string{
-				utils.DisableProvisionedHeadRestartAnnotationKey: "true",
-				pgd.PGDModeAnnotation:                            "true",
-			},
-			want: true,
+			name:        "annotation true + scheduler -> true",
+			annotations: map[string]string{utils.DisableProvisionedHeadRestartAnnotationKey: "true"},
+			gangSched:   true,
+			want:        true,
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			r := &RayClusterReconciler{}
+			if tc.gangSched {
+				r.options.BatchSchedulerManager = batchscheduler.NewSchedulerManagerForTest(&fakePodLifecycleScheduler{})
+			}
 			rc := &rayv1.RayCluster{ObjectMeta: metav1.ObjectMeta{Annotations: tc.annotations}}
-			assert.Equal(t, tc.want, shouldSkipHeadPodRestart(rc))
+			assert.Equal(t, tc.want, r.shouldSkipHeadPodRestart(rc))
 		})
 	}
+}
+
+// fakePodLifecycleScheduler is a stub BatchScheduler that implements
+// PodLifecycleScheduler so type-assertions in r.podGangScheduler() succeed.
+// All methods are no-ops; only the type identity matters for these tests.
+type fakePodLifecycleScheduler struct{}
+
+func (*fakePodLifecycleScheduler) Name() string { return "fake-pgd" }
+func (*fakePodLifecycleScheduler) DoBatchSchedulingOnSubmission(_ context.Context, _ metav1.Object) error {
+	return nil
+}
+
+func (*fakePodLifecycleScheduler) AddMetadataToChildResource(_ context.Context, _ metav1.Object, _ metav1.Object, _ string) {
+}
+
+func (*fakePodLifecycleScheduler) CleanupOnCompletion(_ context.Context, _ metav1.Object) (bool, error) {
+	return false, nil
+}
+
+func (*fakePodLifecycleScheduler) UpsertGangForHead(_ context.Context, _ *rayv1.RayCluster, _ *corev1.Pod) error {
+	return nil
+}
+
+func (*fakePodLifecycleScheduler) UpsertGangForWorker(_ context.Context, _ *rayv1.RayCluster, _ *rayv1.WorkerGroupSpec, _ *corev1.Pod) error {
+	return nil
+}
+
+func (*fakePodLifecycleScheduler) SuspendAllGangs(_ context.Context, _ *rayv1.RayCluster) error {
+	return nil
+}
+
+func (*fakePodLifecycleScheduler) SuspendWorkerGang(_ context.Context, _ *rayv1.RayCluster, _ string) error {
+	return nil
+}
+
+func (*fakePodLifecycleScheduler) DeleteAllGangs(_ context.Context, _ *rayv1.RayCluster) error {
+	return nil
+}
+
+func (*fakePodLifecycleScheduler) MarkAndScaleDownGang(_ context.Context, _ *rayv1.RayCluster, _ *rayv1.WorkerGroupSpec) error {
+	return nil
+}
+
+func (*fakePodLifecycleScheduler) QueueStatusReason(_ context.Context, _ *rayv1.RayCluster) (string, error) {
+	return "", nil
 }

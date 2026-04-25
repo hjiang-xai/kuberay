@@ -13,28 +13,6 @@ func rcWithAnnotations(ann map[string]string) *rayv1.RayCluster {
 	return &rayv1.RayCluster{ObjectMeta: metav1.ObjectMeta{Annotations: ann}}
 }
 
-func TestIsEnabled(t *testing.T) {
-	tests := []struct {
-		name     string
-		instance *rayv1.RayCluster
-		want     bool
-	}{
-		{name: "nil instance", instance: nil, want: false},
-		{name: "no annotations", instance: &rayv1.RayCluster{}, want: false},
-		{name: "annotation absent", instance: rcWithAnnotations(map[string]string{"other": "true"}), want: false},
-		{name: "annotation true", instance: rcWithAnnotations(map[string]string{PGDModeAnnotation: "true"}), want: true},
-		{name: "annotation false", instance: rcWithAnnotations(map[string]string{PGDModeAnnotation: "false"}), want: false},
-		{name: "annotation empty", instance: rcWithAnnotations(map[string]string{PGDModeAnnotation: ""}), want: false},
-		{name: "annotation True (case-sensitive)", instance: rcWithAnnotations(map[string]string{PGDModeAnnotation: "True"}), want: false},
-		{name: "annotation 1 (not accepted)", instance: rcWithAnnotations(map[string]string{PGDModeAnnotation: "1"}), want: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, IsEnabled(tt.instance))
-		})
-	}
-}
-
 func TestQueueFor(t *testing.T) {
 	tests := []struct {
 		name     string

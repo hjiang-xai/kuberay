@@ -4,19 +4,6 @@ import (
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 )
 
-// IsEnabled returns true if the RayCluster should be reconciled in PGD-mode
-// (i.e., emit PodGroupDeployment CRs instead of creating Pods directly).
-//
-// Gated by the `dataplatform.x.ai/ray-pgd-mode: "true"` annotation. Default is false, so
-// existing RayClusters and any cluster without the annotation continue to
-// use the upstream code path unchanged.
-func IsEnabled(instance *rayv1.RayCluster) bool {
-	if instance == nil || instance.Annotations == nil {
-		return false
-	}
-	return instance.Annotations[PGDModeAnnotation] == "true"
-}
-
 // QueueFor returns the PGD queue name set on the RayCluster, or "" if unset.
 func QueueFor(instance *rayv1.RayCluster) string {
 	if instance == nil || instance.Annotations == nil {

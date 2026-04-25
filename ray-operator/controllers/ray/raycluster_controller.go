@@ -30,7 +30,6 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -40,13 +39,12 @@ import (
 
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/batchscheduler"
+	schedulerinterface "github.com/ray-project/kuberay/ray-operator/controllers/ray/batchscheduler/interface"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/common"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/expectations"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/metrics"
-	"github.com/ray-project/kuberay/ray-operator/controllers/ray/pgd"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
 	"github.com/ray-project/kuberay/ray-operator/pkg/features"
-	pgdv1alpha1 "github.com/ray-project/kuberay/ray-operator/third_party/pgd/v1alpha1"
 )
 
 type reconcileFunc func(context.Context, *rayv1.RayCluster) error
@@ -60,7 +58,6 @@ func NewReconciler(mgr manager.Manager, options RayClusterReconcilerOptions) *Ra
 		Scheme:                     mgr.GetScheme(),
 		Recorder:                   mgr.GetEventRecorderFor("raycluster-controller"),
 		rayClusterScaleExpectation: expectations.NewRayClusterScaleExpectation(mgr.GetClient()),
-		pgdHelper:                  pgd.New(mgr.GetClient(), mgr.GetScheme()),
 		options:                    options,
 	}
 }
@@ -71,8 +68,29 @@ type RayClusterReconciler struct {
 	Scheme                     *k8sruntime.Scheme
 	Recorder                   record.EventRecorder
 	rayClusterScaleExpectation expectations.RayClusterScaleExpectation
-	pgdHelper                  *pgd.Helper
 	options                    RayClusterReconcilerOptions
+}
+
+// podGangScheduler returns the configured BatchScheduler if it owns pod
+// lifecycle (i.e. implements PodLifecycleScheduler), else nil.
+//
+// PGD is the only scheduler today that returns non-nil here; Volcano /
+// YuniKorn / Kai / scheduler-plugins all return nil because they only gate
+// scheduling of pods that KubeRay creates directly.
+//
+// At every site that would otherwise call r.Create(pod) / r.Delete(pod) /
+// DeleteAllOf(Pod), reconcilePods checks `if pls := r.podGangScheduler(); pls != nil`
+// and dispatches the corresponding gang operation through `pls`.
+func (r *RayClusterReconciler) podGangScheduler() schedulerinterface.PodLifecycleScheduler {
+	if r.options.BatchSchedulerManager == nil {
+		return nil
+	}
+	sched, err := r.options.BatchSchedulerManager.GetScheduler()
+	if err != nil {
+		return nil
+	}
+	pls, _ := sched.(schedulerinterface.PodLifecycleScheduler)
+	return pls
 }
 
 type RayClusterReconcilerOptions struct {
@@ -231,8 +249,8 @@ func (r *RayClusterReconciler) rayClusterReconcile(ctx context.Context, instance
 			// CRs will be GC'd by their owner-ref (RayCluster) once the
 			// Redis-cleanup finalizer is removed below.
 			var headPods corev1.PodList
-			if pgd.IsEnabled(instance) {
-				if err := r.pgdHelper.SuspendPGDs(ctx, instance); err != nil {
+			if pls := r.podGangScheduler(); pls != nil {
+				if err := pls.SuspendAllGangs(ctx, instance); err != nil {
 					return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, err
 				}
 				if err := r.List(ctx, &headPods, common.RayClusterHeadPodsAssociationOptions(instance).ToListOptions()...); err != nil {
@@ -663,10 +681,10 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 	statusConditionGateEnabled := features.Enabled(features.RayClusterStatusConditions)
 	if suspendStatus == rayv1.RayClusterSuspending ||
 		(!statusConditionGateEnabled && instance.Spec.Suspend != nil && *instance.Spec.Suspend) {
-		if pgd.IsEnabled(instance) {
-			if err := r.pgdHelper.SuspendPGDs(ctx, instance); err != nil {
+		if pls := r.podGangScheduler(); pls != nil {
+			if err := pls.SuspendAllGangs(ctx, instance); err != nil {
 				r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToDeletePodCollection),
-					"Failed suspending PGDs for RayCluster %s/%s, %v",
+					"Failed suspending gangs for RayCluster %s/%s, %v",
 					instance.Namespace, instance.Name, err)
 				return errstd.Join(utils.ErrFailedDeleteAllPods, err)
 			}
@@ -702,10 +720,10 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 	// updated pod template to create fresh PGDs.
 	if r.shouldRecreatePodsForUpgrade(ctx, instance) {
 		logger.Info("RayCluster spec changed with Recreate upgradeStrategy, deleting all pods")
-		if pgd.IsEnabled(instance) {
-			if err := r.pgdHelper.DeletePGDs(ctx, instance); err != nil {
+		if pls := r.podGangScheduler(); pls != nil {
+			if err := pls.DeleteAllGangs(ctx, instance); err != nil {
 				r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToDeletePodCollection),
-					"Failed deleting PGDs for Recreate upgrade of RayCluster %s/%s, %v",
+					"Failed deleting gangs for Recreate upgrade of RayCluster %s/%s, %v",
 					instance.Namespace, instance.Name, err)
 				return errstd.Join(utils.ErrFailedDeleteAllPods, err)
 			}
@@ -750,17 +768,18 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 
 		shouldDelete, reason := shouldDeletePod(headPod, rayv1.HeadNode)
 		logger.Info("reconcilePods", "head Pod", headPod.Name, "shouldDelete", shouldDelete, "reason", reason)
-		// PGD mode: the head pod is owned by a PodGroupDeployment CR carrying
-		// PGD's finalizer. A direct r.Delete here would race with PGD's
-		// missingCount calc and PGD would re-create the pod from its
-		// template within seconds. Defer the deletion to PGD's classifier
-		// (planFinalizerCleanup), which removes the finalizer when the pod
-		// reaches a terminal state and lets K8s GC complete the deletion.
-		// The recreation gate at the `len(headPods.Items) == 0` branch
-		// below also short-circuits in PGD mode (see shouldSkipHeadPodRestart),
-		// so the head's full lifecycle is owned by PGD end-to-end.
-		if shouldDelete && pgd.IsEnabled(instance) {
-			logger.Info("reconcilePods", "head Pod", headPod.Name, "PGD mode: deferring deletion to PGD classifier")
+		// PodLifecycleScheduler mode (PGD): the head pod is owned by a gang CR
+		// (PodGroupDeployment) carrying the scheduler's finalizer. A direct
+		// r.Delete here would race with the scheduler's missingCount calc and
+		// it would re-create the pod from its template within seconds. Defer
+		// the deletion to the scheduler's classifier (planFinalizerCleanup),
+		// which removes the finalizer when the pod reaches a terminal state
+		// and lets K8s GC complete the deletion. The recreation gate at the
+		// `len(headPods.Items) == 0` branch below also short-circuits when a
+		// PodLifecycleScheduler is configured (see shouldSkipHeadPodRestart),
+		// so the head's full lifecycle is owned by the scheduler end-to-end.
+		if shouldDelete && r.podGangScheduler() != nil {
+			logger.Info("reconcilePods", "head Pod", headPod.Name, "deferring deletion to PodLifecycleScheduler classifier")
 			shouldDelete = false
 		}
 		if shouldDelete {
@@ -778,7 +797,7 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 		}
 	} else if len(headPods.Items) == 0 {
 		if meta.IsStatusConditionTrue(instance.Status.Conditions, string(rayv1.RayClusterProvisioned)) &&
-			shouldSkipHeadPodRestart(instance) {
+			r.shouldSkipHeadPodRestart(instance) {
 			// Recreating the head Pod if the RayCluster created by RayJob is provisioned doesn't help RayJob.
 			//
 			// Case 1: GCS fault tolerance is disabled
@@ -835,10 +854,10 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 		// Spec.Groups=0 + Spec.MinGroups=0 instead. On unsuspend, the PGD
 		// branch below restores Groups/MinGroups via UpsertPGDForGroup.
 		if worker.Suspend != nil && *worker.Suspend {
-			if pgd.IsEnabled(instance) {
-				if err := r.pgdHelper.SuspendWorkerPGD(ctx, instance, worker.GroupName); err != nil {
+			if pls := r.podGangScheduler(); pls != nil {
+				if err := pls.SuspendWorkerGang(ctx, instance, worker.GroupName); err != nil {
 					r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToDeleteWorkerPodCollection),
-						"Failed suspending PGD for worker group %s in RayCluster %s/%s, %v", worker.GroupName, instance.Namespace, instance.Name, err)
+						"Failed suspending gang for worker group %s in RayCluster %s/%s, %v", worker.GroupName, instance.Namespace, instance.Name, err)
 					return errstd.Join(utils.ErrFailedDeleteWorkerPod, err)
 				}
 			} else if _, err := r.deleteAllPods(ctx, common.RayClusterGroupPodsAssociationOptions(instance, worker.GroupName)); err != nil {
@@ -851,27 +870,30 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 			continue
 		}
 
-		// PGD mode: in this branch, PGD owns the pods. Route scale-down
-		// through PGD's delete-next label, ensure pgd.Spec.Groups matches
-		// workerSpec.Replicas, and skip the per-pod delete/diff logic below
-		// (PGD's handleExcessGroups + missingCount handle scale up/down).
+		// PodLifecycleScheduler mode (PGD): the scheduler owns the pods. Route
+		// scale-down through the scheduler's MarkAndScaleDownGang (which
+		// labels the autoscaler-picked pods so the scheduler evicts them
+		// first), ensure the gang's desired pod count matches
+		// workerSpec.Replicas via UpsertGangForWorker, and skip the per-pod
+		// delete/diff logic below (the scheduler's handleExcessGroups +
+		// missingCount handle scale up/down).
 		//
-		// Skipping the unhealthy-delete loop is intentional: PGD's classifier
-		// owns terminal-pod cleanup. With restartPolicy: Always (recommended
-		// for PGD-mode workers) container crashes are kubelet-restarted in
-		// place and shouldDeletePod rarely fires anyway.
-		if pgd.IsEnabled(instance) {
+		// Skipping the unhealthy-delete loop is intentional: the scheduler's
+		// classifier owns terminal-pod cleanup. With restartPolicy: Always
+		// (recommended for gang-managed workers) container crashes are
+		// kubelet-restarted in place and shouldDeletePod rarely fires anyway.
+		if pls := r.podGangScheduler(); pls != nil {
 			if len(worker.ScaleStrategy.WorkersToDelete) > 0 {
-				if err := r.pgdHelper.MarkAndScaleDown(ctx, instance, &worker); err != nil {
-					r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToDeleteWorkerPod), "Failed PGD scale-down for group %s: %v", worker.GroupName, err)
+				if err := pls.MarkAndScaleDownGang(ctx, instance, &worker); err != nil {
+					r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToDeleteWorkerPod), "Failed gang scale-down for group %s: %v", worker.GroupName, err)
 					return errstd.Join(utils.ErrFailedDeleteWorkerPod, err)
 				}
 				worker.ScaleStrategy.WorkersToDelete = []string{}
 			}
-			// Build a representative pod template and upsert the PGD once for this group.
+			// Build a representative pod template and upsert the gang once for this group.
 			samplePod := r.buildWorkerPod(ctx, *instance, *worker.DeepCopy(), "", 0, 0)
-			if err := r.pgdHelper.UpsertPGDForGroup(ctx, instance, &worker, &samplePod); err != nil {
-				r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToCreateWorkerPod), "Failed upserting worker PGD for group %s: %v", worker.GroupName, err)
+			if err := pls.UpsertGangForWorker(ctx, instance, &worker, &samplePod); err != nil {
+				r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToCreateWorkerPod), "Failed upserting worker gang for group %s: %v", worker.GroupName, err)
 				return errstd.Join(utils.ErrFailedCreateWorkerPod, err)
 			}
 			continue
@@ -1233,21 +1255,21 @@ func (r *RayClusterReconciler) reconcileMultiHostWorkerGroup(ctx context.Context
 //  1. The user (or the RayJob controller for SidecarMode) set
 //     ray.io/disable-provisioned-head-restart=true on the RayCluster.
 //
-//  2. PGD mode: the head pod is owned by a PodGroupDeployment CR, not by
-//     the RayCluster. PGD owns the head's lifecycle (it re-schedules from
-//     its template via missingCount when its accounting demands a head).
-//     KubeRay calling createHeadPod -> UpsertPGDForHead in this branch
-//     would re-assert Spec.Groups=1 right when an upstream RayJob may be
-//     marking the cluster for shutdown, producing a transient "zombie
-//     head" cycle (new head + worker reconnects, then immediate teardown
-//     when the RayCluster cascade GC fires). Treating PGD-mode clusters
-//     as "head lifecycle owned elsewhere" makes the operator's behavior
-//     consistent with that ownership.
-func shouldSkipHeadPodRestart(instance *rayv1.RayCluster) bool {
+//  2. A PodLifecycleScheduler (PGD) is configured: the head pod is owned by
+//     the scheduler's gang CR, not by the RayCluster. The scheduler owns the
+//     head's lifecycle (it re-schedules from its template via missingCount
+//     when its accounting demands a head). KubeRay calling createHeadPod ->
+//     UpsertGangForHead in this branch would re-assert Spec.Groups=1 right
+//     when an upstream RayJob may be marking the cluster for shutdown,
+//     producing a transient "zombie head" cycle (new head + worker reconnects,
+//     then immediate teardown when the RayCluster cascade GC fires). Treating
+//     gang-managed clusters as "head lifecycle owned elsewhere" makes the
+//     operator's behavior consistent with that ownership.
+func (r *RayClusterReconciler) shouldSkipHeadPodRestart(instance *rayv1.RayCluster) bool {
 	if instance.Annotations[utils.DisableProvisionedHeadRestartAnnotationKey] == "true" {
 		return true
 	}
-	return pgd.IsEnabled(instance)
+	return r.podGangScheduler() != nil
 }
 
 // shouldRecreatePodsForUpgrade checks if any pods need to be recreated based on RayClusterSpec changes
@@ -1448,14 +1470,16 @@ func (r *RayClusterReconciler) createHeadPod(ctx context.Context, instance rayv1
 		}
 	}
 
-	// PGD-mode dispatcher: emit a PodGroupDeployment instead of creating the
-	// pod directly; PGD will materialize the head pod with nodeName preset.
-	if pgd.IsEnabled(&instance) {
-		if err := r.pgdHelper.UpsertPGDForHead(ctx, &instance, &pod); err != nil {
-			r.Recorder.Eventf(&instance, corev1.EventTypeWarning, string(utils.FailedToCreateHeadPod), "Failed to upsert head PGD for %s/%s, %v", instance.Namespace, instance.Name, err)
+	// PodLifecycleScheduler dispatcher: when configured (e.g. PGD), the
+	// scheduler emits a gang CR instead of letting KubeRay create the pod
+	// directly; the scheduler's controller materializes the head pod from the
+	// template stored in the gang CR.
+	if pls := r.podGangScheduler(); pls != nil {
+		if err := pls.UpsertGangForHead(ctx, &instance, &pod); err != nil {
+			r.Recorder.Eventf(&instance, corev1.EventTypeWarning, string(utils.FailedToCreateHeadPod), "Failed to upsert head gang for %s/%s, %v", instance.Namespace, instance.Name, err)
 			return err
 		}
-		logger.Info("PGD upserted for head", "rayCluster", instance.Name)
+		logger.Info("Gang upserted for head", "rayCluster", instance.Name)
 		return nil
 	}
 
@@ -1482,16 +1506,17 @@ func (r *RayClusterReconciler) createWorkerPod(ctx context.Context, instance ray
 		}
 	}
 
-	// PGD-mode dispatcher: in PGD mode worker pods are materialized by PGD
-	// from the upserted PodGroupDeployment, not created here. Per-pod creates
-	// from KubeRay are coalesced into a single PGD spec; this dispatcher is
-	// idempotent across multiple invocations within one reconcile.
-	if pgd.IsEnabled(&instance) {
-		if err := r.pgdHelper.UpsertPGDForGroup(ctx, &instance, &worker, &pod); err != nil {
-			r.Recorder.Eventf(&instance, corev1.EventTypeWarning, string(utils.FailedToCreateWorkerPod), "Failed to upsert worker PGD for group %s in cluster %s/%s, %v", worker.GroupName, instance.Namespace, instance.Name, err)
+	// PodLifecycleScheduler dispatcher: when configured (e.g. PGD), worker
+	// pods are materialized by the scheduler from its upserted gang CR, not
+	// created here. Per-pod creates from KubeRay are coalesced into a single
+	// gang spec; the dispatcher is idempotent across multiple invocations
+	// within one reconcile.
+	if pls := r.podGangScheduler(); pls != nil {
+		if err := pls.UpsertGangForWorker(ctx, &instance, &worker, &pod); err != nil {
+			r.Recorder.Eventf(&instance, corev1.EventTypeWarning, string(utils.FailedToCreateWorkerPod), "Failed to upsert worker gang for group %s in cluster %s/%s, %v", worker.GroupName, instance.Namespace, instance.Name, err)
 			return err
 		}
-		logger.Info("PGD upserted for worker group", "rayCluster", instance.Name, "group", worker.GroupName)
+		logger.Info("Gang upserted for worker group", "rayCluster", instance.Name, "group", worker.GroupName)
 		return nil
 	}
 
@@ -1519,15 +1544,15 @@ func (r *RayClusterReconciler) createWorkerPodWithIndex(ctx context.Context, ins
 		}
 	}
 
-	// PGD-mode dispatcher (multi-host indexing path). PGD's GroupSize handles
-	// per-replica multi-host gangs natively; per-host indexing is materialized
-	// by PGD via its rank label.
-	if pgd.IsEnabled(&instance) {
-		if err := r.pgdHelper.UpsertPGDForGroup(ctx, &instance, &worker, &pod); err != nil {
-			r.Recorder.Eventf(&instance, corev1.EventTypeWarning, string(utils.FailedToCreateWorkerPod), "Failed to upsert worker PGD for group %s in cluster %s/%s, %v", worker.GroupName, instance.Namespace, instance.Name, err)
+	// PodLifecycleScheduler dispatcher (multi-host indexing path). The
+	// scheduler's GroupSize handles per-replica multi-host gangs natively;
+	// per-host indexing is materialized via the scheduler's rank label.
+	if pls := r.podGangScheduler(); pls != nil {
+		if err := pls.UpsertGangForWorker(ctx, &instance, &worker, &pod); err != nil {
+			r.Recorder.Eventf(&instance, corev1.EventTypeWarning, string(utils.FailedToCreateWorkerPod), "Failed to upsert worker gang for group %s in cluster %s/%s, %v", worker.GroupName, instance.Namespace, instance.Name, err)
 			return err
 		}
-		logger.Info("PGD upserted for worker group (indexed)", "rayCluster", instance.Name, "group", worker.GroupName, "replicaIndex", replicaIndex)
+		logger.Info("Gang upserted for worker group (indexed)", "rayCluster", instance.Name, "group", worker.GroupName, "replicaIndex", replicaIndex)
 		return nil
 	}
 
@@ -1688,14 +1713,11 @@ func (r *RayClusterReconciler) SetupWithManager(mgr ctrl.Manager, reconcileConcu
 		))).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.Service{}).
-		Owns(&corev1.Secret{}).
-		// PGD mode: pods are owned by the PGD, not the RayCluster, so the
-		// Owns(Pod) above does not enqueue for those events. Add an explicit
-		// PGD ownership watch (drives reconcile on PGD spec/status changes)
-		// plus a label-based Pod watch so we still see pod-level events for
-		// PGD-owned pods.
-		Owns(&pgdv1alpha1.PodGroupDeployment{}).
-		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(pgd.MapPodToRayCluster))
+		Owns(&corev1.Secret{})
+	// Schedulers that own pod lifecycle (e.g. PGD) install their own watches
+	// here via ConfigureReconciler, e.g. Owns(PodGroupDeployment) plus a
+	// label-based Watches(Pod, ...) so the reconciler sees pod events even
+	// when pods are owned by the gang CR rather than by the RayCluster.
 	if r.options.BatchSchedulerManager != nil {
 		r.options.BatchSchedulerManager.ConfigureReconciler(b)
 	}
@@ -1774,9 +1796,9 @@ func (r *RayClusterReconciler) calculateStatus(ctx context.Context, instance *ra
 	// having to `kubectl get pgd` themselves. Once all PGDs are fully
 	// allocated, QueueStatusReason returns "" and we leave the existing
 	// Reason untouched (the Ready branch above clears it).
-	if pgd.IsEnabled(newInstance) && newInstance.Status.State != rayv1.Ready {
-		if reason, err := r.pgdHelper.QueueStatusReason(ctx, newInstance); err != nil {
-			logger.Info("PGD queue status read failed", "error", err)
+	if pls := r.podGangScheduler(); pls != nil && newInstance.Status.State != rayv1.Ready {
+		if reason, err := pls.QueueStatusReason(ctx, newInstance); err != nil {
+			logger.Info("Gang queue status read failed", "error", err)
 		} else if reason != "" {
 			newInstance.Status.Reason = reason
 		}
