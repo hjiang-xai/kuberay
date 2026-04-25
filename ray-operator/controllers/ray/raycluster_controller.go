@@ -750,11 +750,12 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 
 		shouldDelete, reason := shouldDeletePod(headPod, rayv1.HeadNode)
 		logger.Info("reconcilePods", "head Pod", headPod.Name, "shouldDelete", shouldDelete, "reason", reason)
-		// PGD mode: PGD's classifier handles terminal pods (removes its
-		// finalizer, frees the node) and our PGD wrapper sets MinGroups=1 +
-		// shouldSkipHeadPodRestart (auto-set by SidecarMode) keeps KubeRay
-		// from recreating it. Skipping the direct r.Delete avoids a
-		// missingCount race where PGD would re-create the head from spec.
+		// PGD mode: the head pod is owned by a PodGroupDeployment CR carrying
+		// PGD's finalizer. A direct r.Delete here would race with PGD's
+		// missingCount calc and PGD would re-create the pod from its
+		// template within seconds. Defer the deletion to PGD's classifier
+		// (planFinalizerCleanup), which removes the finalizer when the pod
+		// reaches a terminal state and lets K8s GC complete the deletion.
 		if shouldDelete && pgd.IsEnabled(instance) {
 			logger.Info("reconcilePods", "head Pod", headPod.Name, "PGD mode: deferring deletion to PGD classifier")
 			shouldDelete = false
