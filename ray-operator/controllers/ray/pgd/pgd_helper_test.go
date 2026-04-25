@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
@@ -341,4 +342,128 @@ func TestMarkAndScaleDown_AlreadyLabeledIsNoOp(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "victim-pod-0", Namespace: testNS}, updated))
 	_, labeled := updated.Labels[DeleteNextLabelKey]
 	assert.True(t, labeled, "label must still be present")
+}
+
+// newOwnedPGD returns a PGD labeled as belonging to the given RayCluster, ready
+// to be loaded into the fake client.
+func newOwnedPGD(name, clusterName string, groups, minGroups int32) *pgdv1alpha1.PodGroupDeployment {
+	return &pgdv1alpha1.PodGroupDeployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: testNS,
+			Labels:    map[string]string{utils.RayClusterLabelKey: clusterName},
+		},
+		Spec: pgdv1alpha1.PodGroupDeploymentSpec{
+			Groups:    groups,
+			GroupSize: 1,
+			MinGroups: minGroups,
+		},
+	}
+}
+
+func TestSuspendPGDs_SetsGroupsAndMinGroupsToZero(t *testing.T) {
+	scheme := newTestScheme(t)
+	head := newOwnedPGD("myjob-h", "myjob", 1, 1)
+	worker := newOwnedPGD("myjob-w-worker", "myjob", 4, 2)
+	other := newOwnedPGD("notmine-h", "notmine", 1, 1) // different cluster, must not be touched
+	c := clientFake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(head, worker, other).Build()
+	h := New(c, scheme)
+
+	require.NoError(t, h.SuspendPGDs(context.Background(), newRayCluster("myjob", nil)))
+
+	// Both myjob PGDs go to Groups=0, MinGroups=0.
+	for _, name := range []string{"myjob-h", "myjob-w-worker"} {
+		got := &pgdv1alpha1.PodGroupDeployment{}
+		require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: testNS}, got))
+		assert.Equal(t, int32(0), got.Spec.Groups, "%s: Groups must be zeroed during suspend", name)
+		assert.Equal(t, int32(0), got.Spec.MinGroups, "%s: MinGroups must be zeroed (else PGD reports MinGroupsNotMet)", name)
+	}
+
+	// Other cluster's PGD must be untouched.
+	gotOther := &pgdv1alpha1.PodGroupDeployment{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "notmine-h", Namespace: testNS}, gotOther))
+	assert.Equal(t, int32(1), gotOther.Spec.Groups, "other cluster's PGD must not be touched")
+	assert.Equal(t, int32(1), gotOther.Spec.MinGroups)
+}
+
+func TestSuspendPGDs_NoOwnedPGDs(t *testing.T) {
+	// No PGDs exist for this cluster — must not error.
+	scheme := newTestScheme(t)
+	c := clientFake.NewClientBuilder().WithScheme(scheme).Build()
+	h := New(c, scheme)
+	require.NoError(t, h.SuspendPGDs(context.Background(), newRayCluster("myjob", nil)))
+}
+
+func TestSuspendPGDs_AlreadySuspendedIsNoop(t *testing.T) {
+	// PGD already at Groups=0/MinGroups=0 must not bump generation/resourceVersion.
+	scheme := newTestScheme(t)
+	head := newOwnedPGD("myjob-h", "myjob", 0, 0)
+	c := clientFake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(head).Build()
+	h := New(c, scheme)
+
+	before := &pgdv1alpha1.PodGroupDeployment{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "myjob-h", Namespace: testNS}, before))
+
+	require.NoError(t, h.SuspendPGDs(context.Background(), newRayCluster("myjob", nil)))
+
+	after := &pgdv1alpha1.PodGroupDeployment{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "myjob-h", Namespace: testNS}, after))
+	assert.Equal(t, before.ResourceVersion, after.ResourceVersion, "no patch should be issued when already at 0/0")
+}
+
+func TestSuspendWorkerPGD_SetsGroupsAndMinGroupsToZero(t *testing.T) {
+	scheme := newTestScheme(t)
+	head := newOwnedPGD("myjob-h", "myjob", 1, 1) // must NOT be touched
+	worker := newOwnedPGD("myjob-w-worker", "myjob", 4, 2)
+	c := clientFake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(head, worker).Build()
+	h := New(c, scheme)
+
+	require.NoError(t, h.SuspendWorkerPGD(context.Background(), newRayCluster("myjob", nil), "worker"))
+
+	gotWorker := &pgdv1alpha1.PodGroupDeployment{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "myjob-w-worker", Namespace: testNS}, gotWorker))
+	assert.Equal(t, int32(0), gotWorker.Spec.Groups)
+	assert.Equal(t, int32(0), gotWorker.Spec.MinGroups)
+
+	// Head PGD must be untouched (only the named worker is suspended).
+	gotHead := &pgdv1alpha1.PodGroupDeployment{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "myjob-h", Namespace: testNS}, gotHead))
+	assert.Equal(t, int32(1), gotHead.Spec.Groups, "head must not be touched by SuspendWorkerPGD")
+	assert.Equal(t, int32(1), gotHead.Spec.MinGroups)
+}
+
+func TestSuspendWorkerPGD_MissingPGDIsNoop(t *testing.T) {
+	// PGD not yet created — must not error.
+	scheme := newTestScheme(t)
+	c := clientFake.NewClientBuilder().WithScheme(scheme).Build()
+	h := New(c, scheme)
+	require.NoError(t, h.SuspendWorkerPGD(context.Background(), newRayCluster("myjob", nil), "worker"))
+}
+
+func TestDeletePGDs_RemovesAllOwned(t *testing.T) {
+	scheme := newTestScheme(t)
+	head := newOwnedPGD("myjob-h", "myjob", 1, 1)
+	worker := newOwnedPGD("myjob-w-worker", "myjob", 4, 2)
+	other := newOwnedPGD("notmine-h", "notmine", 1, 1)
+	c := clientFake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(head, worker, other).Build()
+	h := New(c, scheme)
+
+	require.NoError(t, h.DeletePGDs(context.Background(), newRayCluster("myjob", nil)))
+
+	for _, name := range []string{"myjob-h", "myjob-w-worker"} {
+		got := &pgdv1alpha1.PodGroupDeployment{}
+		err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: testNS}, got)
+		assert.True(t, apierrors.IsNotFound(err), "%s must be deleted, got err=%v", name, err)
+	}
+
+	// Other cluster's PGD must remain.
+	gotOther := &pgdv1alpha1.PodGroupDeployment{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "notmine-h", Namespace: testNS}, gotOther))
+}
+
+func TestDeletePGDs_EmptyIsNoop(t *testing.T) {
+	scheme := newTestScheme(t)
+	c := clientFake.NewClientBuilder().WithScheme(scheme).Build()
+	h := New(c, scheme)
+	require.NoError(t, h.DeletePGDs(context.Background(), newRayCluster("myjob", nil)))
 }

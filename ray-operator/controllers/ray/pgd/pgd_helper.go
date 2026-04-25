@@ -7,6 +7,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -199,6 +200,111 @@ func (h *Helper) MarkAndScaleDown(ctx context.Context, instance *rayv1.RayCluste
 	}
 	log.Info("PGD scaled", "pgd", pgdName, "groups", desiredGroups)
 	return nil
+}
+
+// SuspendPGDs scales every PGD owned by the given RayCluster to Spec.Groups=0
+// and Spec.MinGroups=0 so PGD's handleExcessGroups drains all pods. This is
+// the PGD-mode replacement for `r.deleteAllPods` in the Suspend / GCS-FT
+// cleanup code paths: a direct r.Delete(pod) would race with PGD's
+// missingCount calc and the pod would be recreated within seconds.
+//
+// MinGroups must also be zeroed: PGD's reconciler returns a fatal error
+// (".spec.groups < .spec.minGroups") when Groups < MinGroups, which would
+// otherwise mark the PGD as failed during the drain.
+//
+// Idempotent: PGDs already at Groups=0/MinGroups=0 are skipped.
+//
+// On unsuspend, the regular UpsertPGDForHead / UpsertPGDForGroup path
+// restores the original Groups + MinGroups in the next reconcile (the
+// suspend code path returns early before reaching the upsert calls).
+func (h *Helper) SuspendPGDs(ctx context.Context, instance *rayv1.RayCluster) error {
+	log := logf.FromContext(ctx)
+	pgds, err := h.listOwnedPGDs(ctx, instance)
+	if err != nil {
+		return err
+	}
+	for i := range pgds {
+		pgd := &pgds[i]
+		if pgd.Spec.Groups == 0 && pgd.Spec.MinGroups == 0 {
+			continue
+		}
+		patch := client.MergeFrom(pgd.DeepCopy())
+		pgd.Spec.Groups = 0
+		pgd.Spec.MinGroups = 0
+		if err := h.Patch(ctx, pgd, patch); err != nil {
+			return fmt.Errorf("patch PGD %s/%s to Groups=0: %w", pgd.Namespace, pgd.Name, err)
+		}
+		log.Info("PGD suspended (Groups=0)", "pgd", pgd.Name)
+	}
+	return nil
+}
+
+// SuspendWorkerPGD scales a single worker group's PGD to Spec.Groups=0 and
+// Spec.MinGroups=0. Used when a single worker group is suspended via
+// workerGroupSpec.Suspend=true. See SuspendPGDs for the rationale.
+//
+// Returns nil (not an error) if the PGD does not yet exist.
+func (h *Helper) SuspendWorkerPGD(ctx context.Context, instance *rayv1.RayCluster, groupName string) error {
+	log := logf.FromContext(ctx)
+	pgdName := WorkerPGDName(instance.Name, groupName)
+	pgd := &pgdv1alpha1.PodGroupDeployment{}
+	if err := h.Get(ctx, types.NamespacedName{Namespace: instance.Namespace, Name: pgdName}, pgd); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get worker PGD %s: %w", pgdName, err)
+	}
+	if pgd.Spec.Groups == 0 && pgd.Spec.MinGroups == 0 {
+		return nil
+	}
+	patch := client.MergeFrom(pgd.DeepCopy())
+	pgd.Spec.Groups = 0
+	pgd.Spec.MinGroups = 0
+	if err := h.Patch(ctx, pgd, patch); err != nil {
+		return fmt.Errorf("patch worker PGD %s to Groups=0: %w", pgdName, err)
+	}
+	log.Info("PGD suspended (Groups=0)", "pgd", pgdName, "group", groupName)
+	return nil
+}
+
+// DeletePGDs deletes every PGD owned by the given RayCluster. Used by the
+// Recreate-strategy upgrade path: the user changed the cluster spec and
+// expects all pods replaced with the new template, so we destroy the PGDs
+// entirely and let the next reconcile pass create fresh ones via UpsertPGDFor*
+// with the updated pod template.
+//
+// PGD pods are owned by their PGD CR via SetControllerReference, so K8s GC
+// cascades pod deletion. PGD's planFinalizerCleanup removes its finalizer
+// from each terminating pod once it classifies the disruption.
+//
+// Idempotent: missing PGDs are silently skipped (already deleted on a
+// previous reconcile pass).
+func (h *Helper) DeletePGDs(ctx context.Context, instance *rayv1.RayCluster) error {
+	log := logf.FromContext(ctx)
+	pgds, err := h.listOwnedPGDs(ctx, instance)
+	if err != nil {
+		return err
+	}
+	for i := range pgds {
+		pgd := &pgds[i]
+		if err := h.Delete(ctx, pgd); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete PGD %s/%s: %w", pgd.Namespace, pgd.Name, err)
+		}
+		log.Info("PGD deleted", "pgd", pgd.Name)
+	}
+	return nil
+}
+
+// listOwnedPGDs returns all PGDs labeled with this RayCluster's name. The
+// label is applied by applyCommonMeta on every upsert, so it covers both
+// head and worker PGDs.
+func (h *Helper) listOwnedPGDs(ctx context.Context, instance *rayv1.RayCluster) ([]pgdv1alpha1.PodGroupDeployment, error) {
+	pgds := &pgdv1alpha1.PodGroupDeploymentList{}
+	sel := labels.SelectorFromSet(labels.Set{utils.RayClusterLabelKey: instance.Name})
+	if err := h.List(ctx, pgds, &client.ListOptions{Namespace: instance.Namespace, LabelSelector: sel}); err != nil {
+		return nil, fmt.Errorf("list PGDs for RayCluster %s/%s: %w", instance.Namespace, instance.Name, err)
+	}
+	return pgds.Items, nil
 }
 
 // applyCommonMeta sets labels/annotations shared by all PGDs we create for a

@@ -221,14 +221,33 @@ func (r *RayClusterReconciler) rayClusterReconcile(ctx context.Context, instance
 				"deletionTimestamp", instance.ObjectMeta.DeletionTimestamp,
 			)
 
-			// Delete the head Pod if it exists.
-			headPods, err := r.deleteAllPods(ctx, common.RayClusterHeadPodsAssociationOptions(instance))
-			if err != nil {
-				return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, err
-			}
-			// Delete all worker Pods if they exist.
-			if _, err = r.deleteAllPods(ctx, common.RayClusterWorkerPodsAssociationOptions(instance)); err != nil {
-				return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, err
+			// Delete the head + worker Pods so the GCS process stops writing
+			// to Redis before we run the cleanup Job.
+			//
+			// PGD mode: pods are owned by PodGroupDeployment CRs (with PGD's
+			// own finalizer). A direct r.Delete(pod) would race with PGD's
+			// missingCount calc — it would re-create the pod. Instead scale
+			// the PGDs to Groups=0 and let PGD drain them; the cluster's PGD
+			// CRs will be GC'd by their owner-ref (RayCluster) once the
+			// Redis-cleanup finalizer is removed below.
+			var headPods corev1.PodList
+			if pgd.IsEnabled(instance) {
+				if err := r.pgdHelper.SuspendPGDs(ctx, instance); err != nil {
+					return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, err
+				}
+				if err := r.List(ctx, &headPods, common.RayClusterHeadPodsAssociationOptions(instance).ToListOptions()...); err != nil {
+					return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, err
+				}
+			} else {
+				var err error
+				headPods, err = r.deleteAllPods(ctx, common.RayClusterHeadPodsAssociationOptions(instance))
+				if err != nil {
+					return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, err
+				}
+				// Delete all worker Pods if they exist.
+				if _, err = r.deleteAllPods(ctx, common.RayClusterWorkerPodsAssociationOptions(instance)); err != nil {
+					return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, err
+				}
 			}
 			if len(headPods.Items) > 0 {
 				logger.Info(
@@ -632,12 +651,26 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 		return err
 	}
 
-	// if RayCluster is suspending, delete all pods and skip reconcile
+	// if RayCluster is suspending, delete all pods and skip reconcile.
+	//
+	// PGD mode: the pods are owned by PGD CRs and a direct DeleteAllOf would
+	// race with PGD's missingCount calc (it would re-create them within
+	// seconds). Instead we patch every owned PGD to Spec.Groups=0 +
+	// Spec.MinGroups=0 and let PGD's handleExcessGroups drain the pods.
+	// On unsuspend, this code path is skipped and UpsertPGDForHead /
+	// UpsertPGDForGroup restore the original Groups + MinGroups.
 	suspendStatus := utils.FindRayClusterSuspendStatus(instance)
 	statusConditionGateEnabled := features.Enabled(features.RayClusterStatusConditions)
 	if suspendStatus == rayv1.RayClusterSuspending ||
 		(!statusConditionGateEnabled && instance.Spec.Suspend != nil && *instance.Spec.Suspend) {
-		if _, err := r.deleteAllPods(ctx, common.RayClusterAllPodsAssociationOptions(instance)); err != nil {
+		if pgd.IsEnabled(instance) {
+			if err := r.pgdHelper.SuspendPGDs(ctx, instance); err != nil {
+				r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToDeletePodCollection),
+					"Failed suspending PGDs for RayCluster %s/%s, %v",
+					instance.Namespace, instance.Name, err)
+				return errstd.Join(utils.ErrFailedDeleteAllPods, err)
+			}
+		} else if _, err := r.deleteAllPods(ctx, common.RayClusterAllPodsAssociationOptions(instance)); err != nil {
 			r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToDeletePodCollection),
 				"Failed deleting Pods due to suspension for RayCluster %s/%s, %v",
 				instance.Namespace, instance.Name, err)
@@ -660,10 +693,23 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 		}
 	}
 
-	// Check if pods need to be recreated with Recreate upgradeStrategy
+	// Check if pods need to be recreated with Recreate upgradeStrategy.
+	//
+	// PGD mode: the pods are owned by PGD CRs, so a direct DeleteAllOf would
+	// be undone by PGD recreating from the (still-old) pod template. Delete
+	// the PGD CRs entirely so cascade GC removes the pods; the next
+	// reconcile pass calls UpsertPGDForHead / UpsertPGDForGroup with the
+	// updated pod template to create fresh PGDs.
 	if r.shouldRecreatePodsForUpgrade(ctx, instance) {
 		logger.Info("RayCluster spec changed with Recreate upgradeStrategy, deleting all pods")
-		if _, err := r.deleteAllPods(ctx, common.RayClusterAllPodsAssociationOptions(instance)); err != nil {
+		if pgd.IsEnabled(instance) {
+			if err := r.pgdHelper.DeletePGDs(ctx, instance); err != nil {
+				r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToDeletePodCollection),
+					"Failed deleting PGDs for Recreate upgrade of RayCluster %s/%s, %v",
+					instance.Namespace, instance.Name, err)
+				return errstd.Join(utils.ErrFailedDeleteAllPods, err)
+			}
+		} else if _, err := r.deleteAllPods(ctx, common.RayClusterAllPodsAssociationOptions(instance)); err != nil {
 			r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToDeletePodCollection),
 				"Failed deleting Pods due to spec change with Recreate upgradeStrategy for RayCluster %s/%s, %v",
 				instance.Namespace, instance.Name, err)
@@ -778,9 +824,20 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 			return err
 		}
 
-		// Delete all workers if worker group is suspended and skip reconcile
+		// Delete all workers if worker group is suspended and skip reconcile.
+		//
+		// PGD mode: same rationale as the cluster-wide suspend — direct pod
+		// deletes race with PGD's missingCount. Patch this group's PGD to
+		// Spec.Groups=0 + Spec.MinGroups=0 instead. On unsuspend, the PGD
+		// branch below restores Groups/MinGroups via UpsertPGDForGroup.
 		if worker.Suspend != nil && *worker.Suspend {
-			if _, err := r.deleteAllPods(ctx, common.RayClusterGroupPodsAssociationOptions(instance, worker.GroupName)); err != nil {
+			if pgd.IsEnabled(instance) {
+				if err := r.pgdHelper.SuspendWorkerPGD(ctx, instance, worker.GroupName); err != nil {
+					r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToDeleteWorkerPodCollection),
+						"Failed suspending PGD for worker group %s in RayCluster %s/%s, %v", worker.GroupName, instance.Namespace, instance.Name, err)
+					return errstd.Join(utils.ErrFailedDeleteWorkerPod, err)
+				}
+			} else if _, err := r.deleteAllPods(ctx, common.RayClusterGroupPodsAssociationOptions(instance, worker.GroupName)); err != nil {
 				r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToDeleteWorkerPodCollection),
 					"Failed deleting worker Pods for suspended group %s in RayCluster %s/%s, %v", worker.GroupName, instance.Namespace, instance.Name, err)
 				return errstd.Join(utils.ErrFailedDeleteWorkerPod, err)
