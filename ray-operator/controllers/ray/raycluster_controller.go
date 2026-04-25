@@ -756,6 +756,9 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 		// template within seconds. Defer the deletion to PGD's classifier
 		// (planFinalizerCleanup), which removes the finalizer when the pod
 		// reaches a terminal state and lets K8s GC complete the deletion.
+		// The recreation gate at the `len(headPods.Items) == 0` branch
+		// below also short-circuits in PGD mode (see shouldSkipHeadPodRestart),
+		// so the head's full lifecycle is owned by PGD end-to-end.
 		if shouldDelete && pgd.IsEnabled(instance) {
 			logger.Info("reconcilePods", "head Pod", headPod.Name, "PGD mode: deferring deletion to PGD classifier")
 			shouldDelete = false
@@ -788,7 +791,7 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 			// In this case, the worker Pods will not be killed by the new head Pod when it is created, but the submission ID has already been
 			// used by the old Ray job, so the new Ray job will fail.
 			logger.Info(
-				"reconcilePods: Found 0 head Pods for the RayCluster; Skipped head recreation due to ray.io/disable-provisioned-head-restart",
+				"reconcilePods: Found 0 head Pods for the RayCluster; Skipped head recreation per shouldSkipHeadPodRestart (annotation or PGD mode)",
 				"rayCluster", instance.Name,
 			)
 			return nil
@@ -1224,8 +1227,27 @@ func (r *RayClusterReconciler) reconcileMultiHostWorkerGroup(ctx context.Context
 	return nil
 }
 
+// shouldSkipHeadPodRestart returns true when KubeRay should NOT recreate a
+// missing head pod for an already-provisioned RayCluster. Two cases:
+//
+//  1. The user (or the RayJob controller for SidecarMode) set
+//     ray.io/disable-provisioned-head-restart=true on the RayCluster.
+//
+//  2. PGD mode: the head pod is owned by a PodGroupDeployment CR, not by
+//     the RayCluster. PGD owns the head's lifecycle (it re-schedules from
+//     its template via missingCount when its accounting demands a head).
+//     KubeRay calling createHeadPod -> UpsertPGDForHead in this branch
+//     would re-assert Spec.Groups=1 right when an upstream RayJob may be
+//     marking the cluster for shutdown, producing a transient "zombie
+//     head" cycle (new head + worker reconnects, then immediate teardown
+//     when the RayCluster cascade GC fires). Treating PGD-mode clusters
+//     as "head lifecycle owned elsewhere" makes the operator's behavior
+//     consistent with that ownership.
 func shouldSkipHeadPodRestart(instance *rayv1.RayCluster) bool {
-	return instance.Annotations[utils.DisableProvisionedHeadRestartAnnotationKey] == "true"
+	if instance.Annotations[utils.DisableProvisionedHeadRestartAnnotationKey] == "true" {
+		return true
+	}
+	return pgd.IsEnabled(instance)
 }
 
 // shouldRecreatePodsForUpgrade checks if any pods need to be recreated based on RayClusterSpec changes

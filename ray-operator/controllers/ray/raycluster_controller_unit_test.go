@@ -57,6 +57,7 @@ import (
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/common"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/expectations"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/metrics/mocks"
+	"github.com/ray-project/kuberay/ray-operator/controllers/ray/pgd"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
 	"github.com/ray-project/kuberay/ray-operator/pkg/client/clientset/versioned/scheme"
 	"github.com/ray-project/kuberay/ray-operator/pkg/features"
@@ -3888,5 +3889,55 @@ func TestReconcilePodsWithAuthTokenSecretName(t *testing.T) {
 			}
 		}
 		assert.True(t, authTokenEnvFound, "Auth token env var with provided secret name not found")
+	}
+}
+
+func TestShouldSkipHeadPodRestart(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        bool
+	}{
+		{
+			name:        "no annotations -> false",
+			annotations: nil,
+			want:        false,
+		},
+		{
+			name:        "disable-provisioned-head-restart=true -> true",
+			annotations: map[string]string{utils.DisableProvisionedHeadRestartAnnotationKey: "true"},
+			want:        true,
+		},
+		{
+			name:        "disable-provisioned-head-restart=false -> false",
+			annotations: map[string]string{utils.DisableProvisionedHeadRestartAnnotationKey: "false"},
+			want:        false,
+		},
+		{
+			// PGD owns the head lifecycle; KubeRay must not race PGD by re-asserting
+			// Spec.Groups=1 via createHeadPod when the head is briefly absent.
+			name:        "PGD mode annotation -> true",
+			annotations: map[string]string{pgd.PGDModeAnnotation: "true"},
+			want:        true,
+		},
+		{
+			name:        "PGD mode annotation explicitly false -> false",
+			annotations: map[string]string{pgd.PGDModeAnnotation: "false"},
+			want:        false,
+		},
+		{
+			name: "both annotations set -> true",
+			annotations: map[string]string{
+				utils.DisableProvisionedHeadRestartAnnotationKey: "true",
+				pgd.PGDModeAnnotation:                            "true",
+			},
+			want: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rc := &rayv1.RayCluster{ObjectMeta: metav1.ObjectMeta{Annotations: tc.annotations}}
+			assert.Equal(t, tc.want, shouldSkipHeadPodRestart(rc))
+		})
 	}
 }
