@@ -40,7 +40,7 @@ func New(c client.Client, scheme *runtime.Scheme) *Helper {
 //   - GroupSize = 1
 //   - MinGroups = 1                                          (head must always be present)
 //   - RequiredTopologyKey = "kubernetes.io/hostname"         (single-node group)
-//   - Movable  = false                                       (concern #13: never let defrag move us)
+//   - Movable  = false                                       (head pod must never be relocated by PGD's defrag pass: a head move would invalidate every worker's GCS/dashboard connection)
 func (h *Helper) UpsertPGDForHead(ctx context.Context, instance *rayv1.RayCluster, headPod *corev1.Pod) error {
 	pgd := &pgdv1alpha1.PodGroupDeployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -75,7 +75,7 @@ func (h *Helper) UpsertPGDForHead(ctx context.Context, instance *rayv1.RayCluste
 //   - Groups    = workerSpec.Replicas              (autoscaler-adjusted desired count)
 //   - GroupSize = max(1, workerSpec.NumOfHosts)    (multi-host => one group is N pods)
 //   - MinGroups = workerSpec.MinReplicas           (gang-schedule at least this many)
-//   - Movable  = false                             (concern #13)
+//   - Movable  = false                             (Ray workers are stateful peers of the head; relocating a worker mid-job kills its actor state)
 //
 // For NumOfHosts == 1, RequiredTopologyKey is left empty (multi-node spread). For
 // NumOfHosts > 1, the gang lands on one node when "kubernetes.io/hostname" is set;

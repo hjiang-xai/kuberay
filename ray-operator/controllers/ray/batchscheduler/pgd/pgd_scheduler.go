@@ -87,6 +87,14 @@ func (s *Scheduler) AddMetadataToChildResource(_ context.Context, _ metav1.Objec
 // resources promptly. This mirrors what Volcano's CleanupOnCompletion does
 // for its PodGroup CR.
 //
+// Note: the RayCluster's cascade GC will also delete these PGDs when the
+// RayCluster itself is later deleted (via shutdownAfterJobFinishes /
+// ttlSecondsAfterFinished). Calling DeletePGDs explicitly here is intentionally
+// redundant -- it releases queue capacity at terminal state instead of waiting
+// for the cluster TTL to elapse, which can be tens of seconds to minutes
+// depending on configuration. The explicit delete is a no-op if the cascade
+// has already won the race.
+//
 // Returns (false, nil) for non-RayJob objects (no-op for RayCluster directly,
 // since cascade GC handles those when the RayCluster is deleted).
 func (s *Scheduler) CleanupOnCompletion(ctx context.Context, object metav1.Object) (bool, error) {

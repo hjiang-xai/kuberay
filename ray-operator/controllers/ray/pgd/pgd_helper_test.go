@@ -80,7 +80,7 @@ func TestUpsertPGDForHead_Create(t *testing.T) {
 	assert.Equal(t, int32(1), pgd.Spec.GroupSize, "head GroupSize must be 1")
 	assert.Equal(t, int32(1), pgd.Spec.MinGroups, "head MinGroups must be 1 (always present)")
 	assert.Equal(t, "kubernetes.io/hostname", pgd.Spec.RequiredTopologyKey, "head must be single-node")
-	assert.False(t, pgd.Spec.Movable, "head must not be Movable (concern #13)")
+	assert.False(t, pgd.Spec.Movable, "head must not be Movable: PGD's defrag must never relocate the head pod")
 	assert.Equal(t, "freebie", pgd.Spec.Queue)
 	assert.Equal(t, int32(100), pgd.Spec.Priority)
 	assert.Equal(t, "myjob", pgd.Labels[utils.RayClusterLabelKey])

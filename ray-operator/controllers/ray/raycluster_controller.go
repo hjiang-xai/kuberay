@@ -250,6 +250,13 @@ func (r *RayClusterReconciler) rayClusterReconcile(ctx context.Context, instance
 			// Redis-cleanup finalizer is removed below.
 			var headPods corev1.PodList
 			if pls := r.podGangScheduler(); pls != nil {
+				// SuspendAllGangs drains BOTH head and worker PGDs in one call
+				// (it scales every PGD owned by this RayCluster to Groups=0),
+				// so we don't need a separate worker-pod delete. We then List
+				// (not Delete) the head pods because the block below uses the
+				// head pod's annotations to find the Redis storage namespace
+				// for the cleanup Job; deletion is handled asynchronously by
+				// the gang scheduler as it drains the head PGD.
 				if err := pls.SuspendAllGangs(ctx, instance); err != nil {
 					return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, err
 				}
@@ -890,7 +897,13 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 				}
 				worker.ScaleStrategy.WorkersToDelete = []string{}
 			}
-			// Build a representative pod template and upsert the gang once for this group.
+			// Build a representative pod template and upsert the gang once for
+			// this group. The empty name + (replicaIndex=0, podIndex=0) are
+			// safe: the gang scheduler reads only `samplePod.ObjectMeta.{Labels,
+			// Annotations}` and `samplePod.Spec` to build its CR's pod template.
+			// `Name` is left empty (the gang scheduler materializes pods with
+			// its own naming scheme), and the indices only affect host-rank
+			// labels which the scheduler also overrides per-replica.
 			samplePod := r.buildWorkerPod(ctx, *instance, *worker.DeepCopy(), "", 0, 0)
 			if err := pls.UpsertGangForWorker(ctx, instance, &worker, &samplePod); err != nil {
 				r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToCreateWorkerPod), "Failed upserting worker gang for group %s: %v", worker.GroupName, err)

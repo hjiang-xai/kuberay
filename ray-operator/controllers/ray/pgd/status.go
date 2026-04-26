@@ -19,10 +19,10 @@ import (
 // yet materialized. Returns "" if every PGD is fully scheduled (in which case
 // the caller should leave the existing Reason alone).
 //
-// This addresses concern #1 (queue visibility): KubeRay's existing empty
+// Surfaces queue visibility into RayCluster.Status: KubeRay's existing empty
 // `Status.State` already represents "pods not running yet"; this just attaches
-// a human-readable reason so users can see WHY without having to
-// `kubectl get pgd`.
+// a human-readable reason so users can see WHY (e.g. "queued behind other
+// workloads in queue=batch") without having to `kubectl get pgd` themselves.
 func (h *Helper) QueueStatusReason(ctx context.Context, instance *rayv1.RayCluster) (string, error) {
 	pgds := &pgdv1alpha1.PodGroupDeploymentList{}
 	sel := labels.SelectorFromSet(labels.Set{utils.RayClusterLabelKey: instance.Name})
