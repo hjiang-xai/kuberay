@@ -60,15 +60,22 @@ func TestWorkerPGDName(t *testing.T) {
 	}
 }
 
-// TestNamingDeterministic ensures repeated calls produce identical names so the
-// helper's CreateOrPatch addresses the same PGD CR each reconcile.
+// TestNamingDeterministic ensures repeated calls produce identical names so
+// the helper's CreateOrPatch addresses the same PGD CR each reconcile. We
+// snapshot once and compare every subsequent call against the snapshot to
+// catch any non-determinism (e.g. someone replacing sha256 with a randomized
+// hash).
 func TestNamingDeterministic(t *testing.T) {
-	for i := 0; i < 100; i++ {
-		assert.Equal(t, HeadPGDName("myjob"), HeadPGDName("myjob"))
-		assert.Equal(t, WorkerPGDName("myjob", "worker"), WorkerPGDName("myjob", "worker"))
-		long := strings.Repeat("x", 200)
-		assert.Equal(t, HeadPGDName(long), HeadPGDName(long))
-		assert.Equal(t, WorkerPGDName(long, "worker"), WorkerPGDName(long, "worker"))
+	long := strings.Repeat("x", 200)
+	headShort := HeadPGDName("myjob")
+	workerShort := WorkerPGDName("myjob", "worker")
+	headLong := HeadPGDName(long)
+	workerLong := WorkerPGDName(long, "worker")
+	for range 100 {
+		assert.Equal(t, headShort, HeadPGDName("myjob"))
+		assert.Equal(t, workerShort, WorkerPGDName("myjob", "worker"))
+		assert.Equal(t, headLong, HeadPGDName(long))
+		assert.Equal(t, workerLong, WorkerPGDName(long, "worker"))
 	}
 }
 

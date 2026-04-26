@@ -25,11 +25,15 @@ func newTestScheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
-func newPGD(name, namespace, clusterName, queue string, groups, allocated int32) *pgdv1alpha1.PodGroupDeployment {
+// All status_test cases share the same namespace; inlining keeps the helper
+// signature short and avoids unparam noise.
+const statusTestNS = "default"
+
+func newPGD(name, clusterName, queue string, groups, allocated int32) *pgdv1alpha1.PodGroupDeployment {
 	return &pgdv1alpha1.PodGroupDeployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: namespace,
+			Namespace: statusTestNS,
 			Labels:    map[string]string{utils.RayClusterLabelKey: clusterName},
 		},
 		Spec: pgdv1alpha1.PodGroupDeploymentSpec{
@@ -63,38 +67,38 @@ func TestQueueStatusReason(t *testing.T) {
 		{
 			name: "all PGDs fully allocated returns empty",
 			pgds: []*pgdv1alpha1.PodGroupDeployment{
-				newPGD(cluster+"-h", ns, cluster, "freebie", 1, 1),
-				newPGD(cluster+"-w-worker", ns, cluster, "freebie", 4, 4),
+				newPGD(cluster+"-h", cluster, "freebie", 1, 1),
+				newPGD(cluster+"-w-worker", cluster, "freebie", 4, 4),
 			},
 			want: "",
 		},
 		{
 			name: "head pending shows in reason",
 			pgds: []*pgdv1alpha1.PodGroupDeployment{
-				newPGD(cluster+"-h", ns, cluster, "freebie", 1, 0),
+				newPGD(cluster+"-h", cluster, "freebie", 1, 0),
 			},
 			want: "PGD queued: myjob-h=0/1 (queue=freebie)",
 		},
 		{
 			name: "multiple pending sorted by name",
 			pgds: []*pgdv1alpha1.PodGroupDeployment{
-				newPGD(cluster+"-w-worker", ns, cluster, "batch", 4, 1),
-				newPGD(cluster+"-h", ns, cluster, "freebie", 1, 0),
+				newPGD(cluster+"-w-worker", cluster, "batch", 4, 1),
+				newPGD(cluster+"-h", cluster, "freebie", 1, 0),
 			},
 			want: "PGD queued: myjob-h=0/1 (queue=freebie), myjob-w-worker=1/4 (queue=batch)",
 		},
 		{
 			name: "queue empty shows <none>",
 			pgds: []*pgdv1alpha1.PodGroupDeployment{
-				newPGD(cluster+"-h", ns, cluster, "", 1, 0),
+				newPGD(cluster+"-h", cluster, "", 1, 0),
 			},
 			want: "PGD queued: myjob-h=0/1 (queue=<none>)",
 		},
 		{
 			name: "head ready, worker pending — only worker shown",
 			pgds: []*pgdv1alpha1.PodGroupDeployment{
-				newPGD(cluster+"-h", ns, cluster, "freebie", 1, 1),
-				newPGD(cluster+"-w-worker", ns, cluster, "freebie", 4, 2),
+				newPGD(cluster+"-h", cluster, "freebie", 1, 1),
+				newPGD(cluster+"-w-worker", cluster, "freebie", 4, 2),
 			},
 			want: "PGD queued: myjob-w-worker=2/4 (queue=freebie)",
 		},
@@ -124,8 +128,8 @@ func TestQueueStatusReason_OtherClusterIgnored(t *testing.T) {
 	const ns = "default"
 	scheme := newTestScheme(t)
 	objs := []runtime.Object{
-		newPGD("ours-h", ns, "ours", "freebie", 1, 0),   // ours, pending
-		newPGD("other-h", ns, "other", "freebie", 1, 0), // someone else's, also pending
+		newPGD("ours-h", "ours", "freebie", 1, 0),   // ours, pending
+		newPGD("other-h", "other", "freebie", 1, 0), // someone else's, also pending
 	}
 	c := clientFake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
 	h := New(c, scheme)

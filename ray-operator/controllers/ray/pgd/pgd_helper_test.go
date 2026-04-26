@@ -20,19 +20,24 @@ import (
 
 const testNS = "default"
 
-func newRayCluster(name string, ann map[string]string) *rayv1.RayCluster {
+// All helper-tests use the same canonical RayCluster name. Helpers below
+// hard-code it so callsites stay readable; unparam complains when a parameter
+// only ever takes one value at call sites.
+const testClusterName = "myjob"
+
+func newRayCluster(ann map[string]string) *rayv1.RayCluster {
 	return &rayv1.RayCluster{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
+			Name:        testClusterName,
 			Namespace:   testNS,
-			UID:         types.UID("test-uid-" + name),
+			UID:         types.UID("test-uid-" + testClusterName),
 			Annotations: ann,
 		},
 	}
 }
 
-func newSamplePod(clusterName, groupName string) *corev1.Pod {
-	labels := map[string]string{utils.RayClusterLabelKey: clusterName}
+func newSamplePod(groupName string) *corev1.Pod {
+	labels := map[string]string{utils.RayClusterLabelKey: testClusterName}
 	if groupName != "" {
 		labels[utils.RayNodeGroupLabelKey] = groupName
 	} else {
@@ -65,11 +70,11 @@ func TestUpsertPGDForHead_Create(t *testing.T) {
 	c := clientFake.NewClientBuilder().WithScheme(scheme).Build()
 	h := New(c, scheme)
 
-	rc := newRayCluster("myjob", map[string]string{
+	rc := newRayCluster(map[string]string{
 		PGDQueueAnnotation:    "freebie",
 		PGDPriorityAnnotation: "100",
 	})
-	headPod := newSamplePod("myjob", "")
+	headPod := newSamplePod("")
 
 	require.NoError(t, h.UpsertPGDForHead(context.Background(), rc, headPod))
 
@@ -99,8 +104,8 @@ func TestUpsertPGDForHead_Idempotent(t *testing.T) {
 	c := clientFake.NewClientBuilder().WithScheme(scheme).Build()
 	h := New(c, scheme)
 
-	rc := newRayCluster("myjob", map[string]string{PGDQueueAnnotation: "freebie"})
-	headPod := newSamplePod("myjob", "")
+	rc := newRayCluster(map[string]string{PGDQueueAnnotation: "freebie"})
+	headPod := newSamplePod("")
 
 	require.NoError(t, h.UpsertPGDForHead(context.Background(), rc, headPod))
 	pgd1 := &pgdv1alpha1.PodGroupDeployment{}
@@ -121,12 +126,12 @@ func TestUpsertPGDForGroup_Create(t *testing.T) {
 	c := clientFake.NewClientBuilder().WithScheme(scheme).Build()
 	h := New(c, scheme)
 
-	rc := newRayCluster("myjob", map[string]string{
+	rc := newRayCluster(map[string]string{
 		PGDQueueAnnotation:    "freebie",
 		PGDPriorityAnnotation: "50",
 	})
 	worker := newWorkerSpec("worker", 4, 1, 1)
-	pod := newSamplePod("myjob", "worker")
+	pod := newSamplePod("worker")
 
 	require.NoError(t, h.UpsertPGDForGroup(context.Background(), rc, worker, pod))
 
@@ -148,9 +153,9 @@ func TestUpsertPGDForGroup_MultiHostGangScheduling(t *testing.T) {
 	c := clientFake.NewClientBuilder().WithScheme(scheme).Build()
 	h := New(c, scheme)
 
-	rc := newRayCluster("myjob", nil)
+	rc := newRayCluster(nil)
 	worker := newWorkerSpec("worker", 2, 1, 4) // 2 groups × 4 hosts each
-	pod := newSamplePod("myjob", "worker")
+	pod := newSamplePod("worker")
 
 	require.NoError(t, h.UpsertPGDForGroup(context.Background(), rc, worker, pod))
 
@@ -167,9 +172,9 @@ func TestUpsertPGDForGroup_GroupByKey(t *testing.T) {
 	c := clientFake.NewClientBuilder().WithScheme(scheme).Build()
 	h := New(c, scheme)
 
-	rc := newRayCluster("myjob", map[string]string{PGDGroupByKeyAnnotation: "atomic-key"})
+	rc := newRayCluster(map[string]string{PGDGroupByKeyAnnotation: "atomic-key"})
 	worker := newWorkerSpec("worker", 1, 1, 1)
-	pod := newSamplePod("myjob", "worker")
+	pod := newSamplePod("worker")
 
 	require.NoError(t, h.UpsertPGDForGroup(context.Background(), rc, worker, pod))
 
@@ -186,9 +191,9 @@ func TestUpsertPGDForGroup_NoReplicas(t *testing.T) {
 	c := clientFake.NewClientBuilder().WithScheme(scheme).Build()
 	h := New(c, scheme)
 
-	rc := newRayCluster("myjob", nil)
+	rc := newRayCluster(nil)
 	worker := &rayv1.WorkerGroupSpec{GroupName: "worker", Replicas: nil}
-	pod := newSamplePod("myjob", "worker")
+	pod := newSamplePod("worker")
 
 	require.NoError(t, h.UpsertPGDForGroup(context.Background(), rc, worker, pod))
 
@@ -214,7 +219,7 @@ func TestMarkAndScaleDown_LabelsVictimAndDecrementsGroups(t *testing.T) {
 	c := clientFake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(pgd, victim, other).Build()
 	h := New(c, scheme)
 
-	rc := newRayCluster("myjob", nil)
+	rc := newRayCluster(nil)
 	worker := &rayv1.WorkerGroupSpec{
 		GroupName: "worker",
 		Replicas:  ptr.To(int32(3)), // scale down 4 → 3
@@ -253,7 +258,7 @@ func TestMarkAndScaleDown_NoOpWhenGroupsAlreadyMatch(t *testing.T) {
 	c := clientFake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(pgd).Build()
 	h := New(c, scheme)
 
-	rc := newRayCluster("myjob", nil)
+	rc := newRayCluster(nil)
 	worker := &rayv1.WorkerGroupSpec{
 		GroupName: "worker",
 		Replicas:  ptr.To(int32(3)), // already matches
@@ -275,7 +280,7 @@ func TestMarkAndScaleDown_NoPGDYet(t *testing.T) {
 	c := clientFake.NewClientBuilder().WithScheme(scheme).Build()
 	h := New(c, scheme)
 
-	rc := newRayCluster("myjob", nil)
+	rc := newRayCluster(nil)
 	worker := &rayv1.WorkerGroupSpec{
 		GroupName: "worker",
 		Replicas:  ptr.To(int32(2)),
@@ -296,7 +301,7 @@ func TestMarkAndScaleDown_VictimPodGone(t *testing.T) {
 	c := clientFake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(pgd).Build()
 	h := New(c, scheme)
 
-	rc := newRayCluster("myjob", nil)
+	rc := newRayCluster(nil)
 	worker := &rayv1.WorkerGroupSpec{
 		GroupName: "worker",
 		Replicas:  ptr.To(int32(1)),
@@ -328,7 +333,7 @@ func TestMarkAndScaleDown_AlreadyLabeledIsNoOp(t *testing.T) {
 	c := clientFake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(pgd, victim).Build()
 	h := New(c, scheme)
 
-	rc := newRayCluster("myjob", nil)
+	rc := newRayCluster(nil)
 	worker := &rayv1.WorkerGroupSpec{
 		GroupName: "worker",
 		Replicas:  ptr.To(int32(1)),
@@ -369,7 +374,7 @@ func TestSuspendPGDs_SetsGroupsAndMinGroupsToZero(t *testing.T) {
 	c := clientFake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(head, worker, other).Build()
 	h := New(c, scheme)
 
-	require.NoError(t, h.SuspendPGDs(context.Background(), newRayCluster("myjob", nil)))
+	require.NoError(t, h.SuspendPGDs(context.Background(), newRayCluster(nil)))
 
 	// Both myjob PGDs go to Groups=0, MinGroups=0.
 	for _, name := range []string{"myjob-h", "myjob-w-worker"} {
@@ -391,7 +396,7 @@ func TestSuspendPGDs_NoOwnedPGDs(t *testing.T) {
 	scheme := newTestScheme(t)
 	c := clientFake.NewClientBuilder().WithScheme(scheme).Build()
 	h := New(c, scheme)
-	require.NoError(t, h.SuspendPGDs(context.Background(), newRayCluster("myjob", nil)))
+	require.NoError(t, h.SuspendPGDs(context.Background(), newRayCluster(nil)))
 }
 
 func TestSuspendPGDs_AlreadySuspendedIsNoop(t *testing.T) {
@@ -404,7 +409,7 @@ func TestSuspendPGDs_AlreadySuspendedIsNoop(t *testing.T) {
 	before := &pgdv1alpha1.PodGroupDeployment{}
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "myjob-h", Namespace: testNS}, before))
 
-	require.NoError(t, h.SuspendPGDs(context.Background(), newRayCluster("myjob", nil)))
+	require.NoError(t, h.SuspendPGDs(context.Background(), newRayCluster(nil)))
 
 	after := &pgdv1alpha1.PodGroupDeployment{}
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "myjob-h", Namespace: testNS}, after))
@@ -418,7 +423,7 @@ func TestSuspendWorkerPGD_SetsGroupsAndMinGroupsToZero(t *testing.T) {
 	c := clientFake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(head, worker).Build()
 	h := New(c, scheme)
 
-	require.NoError(t, h.SuspendWorkerPGD(context.Background(), newRayCluster("myjob", nil), "worker"))
+	require.NoError(t, h.SuspendWorkerPGD(context.Background(), newRayCluster(nil), "worker"))
 
 	gotWorker := &pgdv1alpha1.PodGroupDeployment{}
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "myjob-w-worker", Namespace: testNS}, gotWorker))
@@ -437,7 +442,7 @@ func TestSuspendWorkerPGD_MissingPGDIsNoop(t *testing.T) {
 	scheme := newTestScheme(t)
 	c := clientFake.NewClientBuilder().WithScheme(scheme).Build()
 	h := New(c, scheme)
-	require.NoError(t, h.SuspendWorkerPGD(context.Background(), newRayCluster("myjob", nil), "worker"))
+	require.NoError(t, h.SuspendWorkerPGD(context.Background(), newRayCluster(nil), "worker"))
 }
 
 func TestDeletePGDs_RemovesAllOwned(t *testing.T) {
@@ -448,7 +453,7 @@ func TestDeletePGDs_RemovesAllOwned(t *testing.T) {
 	c := clientFake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(head, worker, other).Build()
 	h := New(c, scheme)
 
-	require.NoError(t, h.DeletePGDs(context.Background(), newRayCluster("myjob", nil)))
+	require.NoError(t, h.DeletePGDs(context.Background(), newRayCluster(nil)))
 
 	for _, name := range []string{"myjob-h", "myjob-w-worker"} {
 		got := &pgdv1alpha1.PodGroupDeployment{}
@@ -465,5 +470,5 @@ func TestDeletePGDs_EmptyIsNoop(t *testing.T) {
 	scheme := newTestScheme(t)
 	c := clientFake.NewClientBuilder().WithScheme(scheme).Build()
 	h := New(c, scheme)
-	require.NoError(t, h.DeletePGDs(context.Background(), newRayCluster("myjob", nil)))
+	require.NoError(t, h.DeletePGDs(context.Background(), newRayCluster(nil)))
 }

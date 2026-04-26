@@ -8,7 +8,7 @@ import (
 
 // PGD names are validated by a kubebuilder rule on PodGroupDeployment:
 //
-//   metadata.name must be at most 54 characters
+//	metadata.name must be at most 54 characters
 //
 // (see ray-operator/third_party/pgd/v1alpha1/podgroupdeployment_types.go).
 //

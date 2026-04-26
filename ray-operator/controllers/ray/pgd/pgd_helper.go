@@ -3,6 +3,7 @@ package pgd
 import (
 	"context"
 	"fmt"
+	"maps"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -125,8 +126,8 @@ func (h *Helper) UpsertPGDForGroup(ctx context.Context, instance *rayv1.RayClust
 // MarkAndScaleDown handles autoscaler-driven scale-down for one worker group in
 // PGD mode. The Ray autoscaler patches the RayCluster spec with:
 //
-//   workerGroupSpecs[i].replicas = N - K
-//   workerGroupSpecs[i].scaleStrategy.workersToDelete = [<podName>, ...]
+//	workerGroupSpecs[i].replicas = N - K
+//	workerGroupSpecs[i].scaleStrategy.workersToDelete = [<podName>, ...]
 //
 // In upstream KubeRay, the operator calls r.Delete(pod) directly. In PGD mode
 // PGD owns the pods (with finalizers), so a direct Delete causes thrash:
@@ -134,18 +135,18 @@ func (h *Helper) UpsertPGDForGroup(ctx context.Context, instance *rayv1.RayClust
 //
 // Instead we use PGD's first-class delete-next mechanism:
 //
-//   1. Label each pod the autoscaler picked with `podgroup-operator.x.ai/delete-next=""`.
-//      PGD's heap (`groups.go:Less`) sorts these to the top of the eviction order;
-//      `handleExcessGroups` in `reconcile.go` pops them first when excess > 0.
+//  1. Label each pod the autoscaler picked with `podgroup-operator.x.ai/delete-next=""`.
+//     PGD's heap (`groups.go:Less`) sorts these to the top of the eviction order;
+//     `handleExcessGroups` in `reconcile.go` pops them first when excess > 0.
 //
-//   2. Patch pgd.Spec.Groups = workerSpec.Replicas to create the excess. PGD's
-//      next reconcile cycle deterministically deletes the labeled pods.
+//  2. Patch pgd.Spec.Groups = workerSpec.Replicas to create the excess. PGD's
+//     next reconcile cycle deterministically deletes the labeled pods.
 //
 // Cache-coherency safety (PGD's informer is independent of ours):
 //   - both updates visible: PGD evicts the right victims                      ✓
 //   - only labels visible:  excess=0, no-op cycle, retries when spec arrives  ✓
 //   - only spec visible:    PGD picks wrong victims once, autoscaler's
-//                           safe_to_scale check fails, retries on next cycle  ✓
+//     safe_to_scale check fails, retries on next cycle  ✓
 //
 // missingCount = Spec.Groups - terminal - groups.Len() stays balanced because
 // we never call Delete() ourselves.
@@ -344,13 +345,9 @@ func applyPodTemplateToPGD(pgd *pgdv1alpha1.PodGroupDeployment, pod *corev1.Pod)
 	// Copy labels (preserve KubeRay's ray.io/* labels so all existing label-based
 	// pod listing in the operator continues to work).
 	labels := map[string]string{}
-	for k, v := range pod.Labels {
-		labels[k] = v
-	}
+	maps.Copy(labels, pod.Labels)
 	annotations := map[string]string{}
-	for k, v := range pod.Annotations {
-		annotations[k] = v
-	}
+	maps.Copy(annotations, pod.Annotations)
 
 	pgd.Spec.Deployment.Template.ObjectMeta.Labels = labels
 	pgd.Spec.Deployment.Template.ObjectMeta.Annotations = annotations
