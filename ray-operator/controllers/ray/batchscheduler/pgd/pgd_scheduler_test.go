@@ -254,6 +254,36 @@ func TestSuspendWorkerGang_DelegatesToHelper(t *testing.T) {
 	assert.Equal(t, int32(0), got.Spec.MinGroups)
 }
 
+func TestMarkAndScaleDownGang_DelegatesToHelper(t *testing.T) {
+	// MarkAndScaleDownGang is the only PodLifecycleScheduler method that
+	// previously had NO adapter-level test. Helper-level coverage in
+	// pgd_helper_test.go is comprehensive; this test pins the adapter's
+	// delegation contract: the call must reach the helper, the helper's
+	// Patch must take effect, and Spec.Groups must reflect the new Replicas.
+	workerPGD := &pgdv1alpha1.PodGroupDeployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "myjob-w-worker",
+			Namespace: testNS,
+			Labels:    map[string]string{utils.RayClusterLabelKey: "myjob"},
+		},
+		Spec: pgdv1alpha1.PodGroupDeploymentSpec{Groups: 4, GroupSize: 1},
+	}
+	s, c := newScheduler(t, workerPGD)
+	rc := newRayCluster("myjob")
+	worker := &rayv1.WorkerGroupSpec{
+		GroupName: "worker",
+		Replicas:  ptr.To(int32(3)),
+		ScaleStrategy: rayv1.ScaleStrategy{
+			WorkersToDelete: []string{}, // no victims; just exercising the Groups patch
+		},
+	}
+	require.NoError(t, s.MarkAndScaleDownGang(context.Background(), rc, worker))
+
+	got := &pgdv1alpha1.PodGroupDeployment{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "myjob-w-worker", Namespace: testNS}, got))
+	assert.Equal(t, int32(3), got.Spec.Groups, "adapter must propagate Replicas through to the helper's Groups patch")
+}
+
 func TestDeleteAllGangs_DelegatesToHelper(t *testing.T) {
 	headPGD := &pgdv1alpha1.PodGroupDeployment{
 		ObjectMeta: metav1.ObjectMeta{

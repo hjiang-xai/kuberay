@@ -25,15 +25,13 @@ func newTestScheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
-// All status_test cases share the same namespace; inlining keeps the helper
-// signature short and avoids unparam noise.
-const statusTestNS = "default"
-
+// newPGD reuses the package-shared `testNS` constant defined in
+// pgd_helper_test.go; both helpers operate in the same namespace.
 func newPGD(name, clusterName, queue string, groups, allocated int32) *pgdv1alpha1.PodGroupDeployment {
 	return &pgdv1alpha1.PodGroupDeployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: statusTestNS,
+			Namespace: testNS,
 			Labels:    map[string]string{utils.RayClusterLabelKey: clusterName},
 		},
 		Spec: pgdv1alpha1.PodGroupDeploymentSpec{
@@ -49,10 +47,7 @@ func newPGD(name, clusterName, queue string, groups, allocated int32) *pgdv1alph
 }
 
 func TestQueueStatusReason(t *testing.T) {
-	const (
-		ns      = "default"
-		cluster = "myjob"
-	)
+	const cluster = "myjob"
 
 	tests := []struct {
 		name string
@@ -114,7 +109,7 @@ func TestQueueStatusReason(t *testing.T) {
 			c := clientFake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
 			h := New(c, scheme)
 			got, err := h.QueueStatusReason(context.Background(), &rayv1.RayCluster{
-				ObjectMeta: metav1.ObjectMeta{Name: cluster, Namespace: ns},
+				ObjectMeta: metav1.ObjectMeta{Name: cluster, Namespace: testNS},
 			})
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
@@ -125,7 +120,6 @@ func TestQueueStatusReason(t *testing.T) {
 // TestQueueStatusReason_OtherClusterIgnored verifies the label selector scopes to
 // the requested cluster only.
 func TestQueueStatusReason_OtherClusterIgnored(t *testing.T) {
-	const ns = "default"
 	scheme := newTestScheme(t)
 	objs := []runtime.Object{
 		newPGD("ours-h", "ours", "freebie", 1, 0),   // ours, pending
@@ -134,7 +128,7 @@ func TestQueueStatusReason_OtherClusterIgnored(t *testing.T) {
 	c := clientFake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
 	h := New(c, scheme)
 	got, err := h.QueueStatusReason(context.Background(), &rayv1.RayCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "ours", Namespace: ns},
+		ObjectMeta: metav1.ObjectMeta{Name: "ours", Namespace: testNS},
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "PGD queued: ours-h=0/1 (queue=freebie)", got, "must ignore other cluster's PGD")
