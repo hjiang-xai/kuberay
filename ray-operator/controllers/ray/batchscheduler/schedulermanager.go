@@ -13,6 +13,7 @@ import (
 	configapi "github.com/ray-project/kuberay/ray-operator/apis/config/v1alpha1"
 	schedulerinterface "github.com/ray-project/kuberay/ray-operator/controllers/ray/batchscheduler/interface"
 	kaischeduler "github.com/ray-project/kuberay/ray-operator/controllers/ray/batchscheduler/kai-scheduler"
+	pgdscheduler "github.com/ray-project/kuberay/ray-operator/controllers/ray/batchscheduler/pgd"
 	schedulerplugins "github.com/ray-project/kuberay/ray-operator/controllers/ray/batchscheduler/scheduler-plugins"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/batchscheduler/volcano"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/batchscheduler/yunikorn"
@@ -65,6 +66,8 @@ func getSchedulerFactory(rayConfigs configapi.Configuration) (schedulerinterface
 			factory = &kaischeduler.KaiSchedulerFactory{}
 		case schedulerplugins.GetPluginName():
 			factory = &schedulerplugins.KubeSchedulerFactory{}
+		case pgdscheduler.GetPluginName():
+			factory = &pgdscheduler.Factory{}
 		default:
 			return nil, fmt.Errorf("the scheduler is not supported, name=%s", rayConfigs.BatchScheduler)
 		}
