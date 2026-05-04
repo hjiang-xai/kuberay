@@ -18,6 +18,7 @@ COPY pkg/utils pkg/utils
 COPY pkg/webhooks pkg/webhooks
 COPY rayjob-submitter/ rayjob-submitter/
 COPY internal/ internal/
+COPY third_party/ third_party/
 
 # Build
 USER root
