@@ -694,6 +694,109 @@ func TestGetSubmitterTemplate_WithEnableK8sTokenAuth(t *testing.T) {
 	assert.True(t, foundVolumeMount, "Submitter container should have the ray-token volume mount")
 }
 
+// TestRayJobStuckInitializingWhenClusterNeverReady demonstrates that a RayJob
+// stays in Initializing when the RayCluster has a terminal pod failure (e.g.
+// ImagePullBackOff). The controller only checks State != Ready and re-queues,
+// never detecting that the cluster will never become ready.
+func TestRayJobStuckInitializingWhenClusterNeverReady(t *testing.T) {
+	newScheme := runtime.NewScheme()
+	_ = rayv1.AddToScheme(newScheme)
+	_ = corev1.AddToScheme(newScheme)
+
+	rayCluster := &rayv1.RayCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-raycluster",
+			Namespace: "default",
+		},
+		Status: rayv1.RayClusterStatus{
+			// State is empty (not Ready) — simulates a cluster whose head pod
+			// can never start due to e.g. an invalid image.
+			Conditions: []metav1.Condition{
+				{
+					Type:               string(rayv1.HeadPodReady),
+					Status:             metav1.ConditionFalse,
+					Reason:             "ImagePullBackOff",
+					Message:            "Back-off pulling image \"invalid-image:latest\"",
+					LastTransitionTime: metav1.Now(),
+				},
+			},
+		},
+	}
+
+	startTime := metav1.Now()
+	rayJob := &rayv1.RayJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-rayjob",
+			Namespace: "default",
+		},
+		Spec: rayv1.RayJobSpec{
+			Entrypoint: "echo hello",
+			RayClusterSpec: &rayv1.RayClusterSpec{
+				HeadGroupSpec: rayv1.HeadGroupSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "ray-head",
+									Image: "invalid-image:latest",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Status: rayv1.RayJobStatus{
+			JobDeploymentStatus: rayv1.JobDeploymentStatusInitializing,
+			JobStatus:           rayv1.JobStatusNew,
+			RayClusterName:      "test-raycluster",
+			JobId:               "test-job-id",
+			StartTime:           &startTime,
+		},
+	}
+
+	fakeClient := clientFake.NewClientBuilder().
+		WithScheme(newScheme).
+		WithRuntimeObjects(rayJob, rayCluster).
+		WithStatusSubresource(rayJob).
+		Build()
+
+	reconciler := &RayJobReconciler{
+		Client:   fakeClient,
+		Recorder: record.NewFakeRecorder(100),
+		Scheme:   newScheme,
+	}
+
+	// Reconcile multiple times to simulate the re-queue loop.
+	for i := 0; i < 3; i++ {
+		result, err := reconciler.Reconcile(context.Background(), reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      rayJob.Name,
+				Namespace: rayJob.Namespace,
+			},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, RayJobDefaultRequeueDuration, result.RequeueAfter,
+			"iteration %d: expected default requeue duration", i)
+	}
+
+	// Fetch the latest RayJob status.
+	updatedRayJob := &rayv1.RayJob{}
+	err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      rayJob.Name,
+		Namespace: rayJob.Namespace,
+	}, updatedRayJob)
+	require.NoError(t, err)
+
+	// BUG: The RayJob is still Initializing even though the cluster will never
+	// become ready. Ideally, the controller should detect the terminal
+	// HeadPodReady condition (ImagePullBackOff) and fail the RayJob.
+	assert.Equal(t, rayv1.JobDeploymentStatusInitializing, updatedRayJob.Status.JobDeploymentStatus,
+		"RayJob should still be stuck in Initializing (this is the bug)")
+	assert.NotEqual(t, rayv1.JobDeploymentStatusFailed, updatedRayJob.Status.JobDeploymentStatus,
+		"RayJob should NOT have transitioned to Failed (controller does not check HeadPodReady condition)")
+}
+
 func TestBatchSchedulerOnCompletionCalledWhenRayJobComplete(t *testing.T) {
 	tests := []struct {
 		name                string
