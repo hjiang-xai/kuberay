@@ -54,6 +54,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
+	"github.com/ray-project/kuberay/ray-operator/controllers/ray/batchscheduler"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/common"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/expectations"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/metrics/mocks"
@@ -341,7 +342,7 @@ func setupTest(t *testing.T) {
 			},
 			WorkerGroupSpecs: []rayv1.WorkerGroupSpec{
 				{
-					Replicas:    ptr.To(expectReplicaNum),
+					Replicas:    new(expectReplicaNum),
 					MinReplicas: ptr.To[int32](0),
 					MaxReplicas: ptr.To[int32](10000),
 					NumOfHosts:  expectNumOfHostNum,
@@ -1784,7 +1785,7 @@ func TestCalculateStatusWithoutDesiredReplicas(t *testing.T) {
 func TestCalculateStatusWithSuspendedWorkerGroups(t *testing.T) {
 	setupTest(t)
 
-	testRayCluster.Spec.WorkerGroupSpecs[0].Suspend = ptr.To(true)
+	testRayCluster.Spec.WorkerGroupSpecs[0].Suspend = new(true)
 	testRayCluster.Spec.WorkerGroupSpecs[0].MinReplicas = ptr.To[int32](100)
 	testRayCluster.Spec.WorkerGroupSpecs[0].MaxReplicas = ptr.To[int32](100)
 	testRayCluster.Spec.WorkerGroupSpecs[0].Template.Spec.Containers[0].Resources.Requests = corev1.ResourceList{
@@ -2878,7 +2879,7 @@ func TestReconcile_Replicas_Optional(t *testing.T) {
 	assert.Len(t, testRayCluster.Spec.WorkerGroupSpecs, 1, "This test assumes only one worker group.")
 
 	// Disable autoscaling so that the random Pod deletion is enabled.
-	testRayCluster.Spec.EnableInTreeAutoscaling = ptr.To(false)
+	testRayCluster.Spec.EnableInTreeAutoscaling = new(false)
 	testRayCluster.Spec.WorkerGroupSpecs[0].ScaleStrategy.WorkersToDelete = []string{}
 
 	tests := []struct {
@@ -2973,7 +2974,7 @@ func TestReconcile_Multihost_Replicas(t *testing.T) {
 
 	// Disable autoscaling so that the random Pod deletion is enabled.
 	// Set `NumOfHosts` to 4 to specify multi-host group
-	testRayCluster.Spec.EnableInTreeAutoscaling = ptr.To(false)
+	testRayCluster.Spec.EnableInTreeAutoscaling = new(false)
 	testRayCluster.Spec.WorkerGroupSpecs[0].ScaleStrategy.WorkersToDelete = []string{}
 	testRayCluster.Spec.WorkerGroupSpecs[0].NumOfHosts = 4
 
@@ -3070,7 +3071,7 @@ func TestReconcile_NumOfHosts(t *testing.T) {
 
 	// Disable autoscaling so that the random Pod deletion is enabled.
 	// Set `Replicas` to 1 and clear `WorkersToDelete`
-	testRayCluster.Spec.EnableInTreeAutoscaling = ptr.To(false)
+	testRayCluster.Spec.EnableInTreeAutoscaling = new(false)
 	testRayCluster.Spec.WorkerGroupSpecs[0].ScaleStrategy.WorkersToDelete = []string{}
 	testRayCluster.Spec.WorkerGroupSpecs[0].Replicas = ptr.To[int32](1)
 
@@ -3392,15 +3393,15 @@ func Test_ReconcileManagedBy(t *testing.T) {
 			shouldReconcile: true,
 		},
 		{
-			managedBy: ptr.To(""),
+			managedBy: new(""),
 			name:      "ManagedBy field empty",
 		},
 		{
-			managedBy: ptr.To(MultiKueueController),
+			managedBy: new(MultiKueueController),
 			name:      "ManagedBy field to external allowed controller",
 		},
 		{
-			managedBy: ptr.To("controller.com/invalid"),
+			managedBy: new("controller.com/invalid"),
 			name:      "ManagedBy field to external not allowed controller",
 		},
 	}
@@ -3409,7 +3410,7 @@ func Test_ReconcileManagedBy(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			cluster := testRayCluster.DeepCopy()
-			cluster.Spec.EnableInTreeAutoscaling = ptr.To(false)
+			cluster.Spec.EnableInTreeAutoscaling = new(false)
 			cluster.Status = rayv1.RayClusterStatus{}
 			cluster.Spec.ManagedBy = tc.managedBy
 			runtimeObjects := []runtime.Object{cluster}
@@ -3596,7 +3597,7 @@ func TestReconcile_AuthSecret_SkipWhenK8sTokenAuthEnabled(t *testing.T) {
 
 	testRayCluster.Spec.AuthOptions = &rayv1.AuthOptions{
 		Mode:               rayv1.AuthModeToken,
-		EnableK8sTokenAuth: ptr.To(true),
+		EnableK8sTokenAuth: new(true),
 	}
 
 	fakeClient := clientFake.NewClientBuilder().WithRuntimeObjects(testPods...).Build()
@@ -3889,4 +3890,102 @@ func TestReconcilePodsWithAuthTokenSecretName(t *testing.T) {
 		}
 		assert.True(t, authTokenEnvFound, "Auth token env var with provided secret name not found")
 	}
+}
+
+func TestShouldSkipHeadPodRestart(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		gangSched   bool // configure a PodLifecycleScheduler on the reconciler
+		want        bool
+	}{
+		{
+			name:        "no annotations, no scheduler -> false",
+			annotations: nil,
+			gangSched:   false,
+			want:        false,
+		},
+		{
+			name:        "disable-provisioned-head-restart=true -> true",
+			annotations: map[string]string{utils.DisableProvisionedHeadRestartAnnotationKey: "true"},
+			gangSched:   false,
+			want:        true,
+		},
+		{
+			name:        "disable-provisioned-head-restart=false, no scheduler -> false",
+			annotations: map[string]string{utils.DisableProvisionedHeadRestartAnnotationKey: "false"},
+			gangSched:   false,
+			want:        false,
+		},
+		{
+			// A PodLifecycleScheduler (PGD) owns the head lifecycle; KubeRay
+			// must not race the scheduler by re-asserting head presence via
+			// createHeadPod when the head is briefly absent.
+			name:        "PodLifecycleScheduler configured -> true",
+			annotations: nil,
+			gangSched:   true,
+			want:        true,
+		},
+		{
+			name:        "annotation true + scheduler -> true",
+			annotations: map[string]string{utils.DisableProvisionedHeadRestartAnnotationKey: "true"},
+			gangSched:   true,
+			want:        true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &RayClusterReconciler{}
+			if tc.gangSched {
+				r.options.BatchSchedulerManager = batchscheduler.NewSchedulerManagerForTest(&fakePodLifecycleScheduler{})
+			}
+			rc := &rayv1.RayCluster{ObjectMeta: metav1.ObjectMeta{Annotations: tc.annotations}}
+			assert.Equal(t, tc.want, r.shouldSkipHeadPodRestart(rc))
+		})
+	}
+}
+
+// fakePodLifecycleScheduler is a stub BatchScheduler that implements
+// PodLifecycleScheduler so type-assertions in r.podGangScheduler() succeed.
+// All methods are no-ops; only the type identity matters for these tests.
+type fakePodLifecycleScheduler struct{}
+
+func (*fakePodLifecycleScheduler) Name() string { return "fake-pgd" }
+func (*fakePodLifecycleScheduler) DoBatchSchedulingOnSubmission(_ context.Context, _ metav1.Object) error {
+	return nil
+}
+
+func (*fakePodLifecycleScheduler) AddMetadataToChildResource(_ context.Context, _ metav1.Object, _ metav1.Object, _ string) {
+}
+
+func (*fakePodLifecycleScheduler) CleanupOnCompletion(_ context.Context, _ metav1.Object) (bool, error) {
+	return false, nil
+}
+
+func (*fakePodLifecycleScheduler) UpsertGangForHead(_ context.Context, _ *rayv1.RayCluster, _ *corev1.Pod) error {
+	return nil
+}
+
+func (*fakePodLifecycleScheduler) UpsertGangForWorker(_ context.Context, _ *rayv1.RayCluster, _ *rayv1.WorkerGroupSpec, _ *corev1.Pod) error {
+	return nil
+}
+
+func (*fakePodLifecycleScheduler) SuspendAllGangs(_ context.Context, _ *rayv1.RayCluster) error {
+	return nil
+}
+
+func (*fakePodLifecycleScheduler) SuspendWorkerGang(_ context.Context, _ *rayv1.RayCluster, _ string) error {
+	return nil
+}
+
+func (*fakePodLifecycleScheduler) DeleteAllGangs(_ context.Context, _ *rayv1.RayCluster) error {
+	return nil
+}
+
+func (*fakePodLifecycleScheduler) MarkAndScaleDownGang(_ context.Context, _ *rayv1.RayCluster, _ *rayv1.WorkerGroupSpec) error {
+	return nil
+}
+
+func (*fakePodLifecycleScheduler) QueueStatusReason(_ context.Context, _ *rayv1.RayCluster) (string, error) {
+	return "", nil
 }
